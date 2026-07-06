@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
+
+# Lambda packaging artifacts — never commit these
+lambda_package/
+gdrive_to_s3.zip
