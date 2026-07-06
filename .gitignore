@@ -1,0 +1,14 @@
+# Editor
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets
+.env
+
+# Lambda packaging artifacts
+lambda_package/
+gdrive_to_s3.zip
