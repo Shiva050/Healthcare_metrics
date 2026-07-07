@@ -25,7 +25,7 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
 
-    MERGE INTO silver.pbj_daily_nurse_staffing AS tgt
+    MERGE INTO silver.pbj_daily_nurse_staffing
     USING (
         SELECT
             provnum,
@@ -65,15 +65,15 @@ BEGIN
         WHERE provnum IS NOT NULL
           AND workdate IS NOT NULL
     ) AS src
-    ON  tgt.provnum  = src.provnum
-    AND tgt.workdate = src.workdate
+    ON  silver.pbj_daily_nurse_staffing.provnum  = src.provnum
+    AND silver.pbj_daily_nurse_staffing.workdate = src.workdate
 
     -- Update only when incoming file is newer, or same-time but different content
     WHEN MATCHED AND (
-        p_drive_modified_at > tgt._drive_modified_at
+        p_drive_modified_at > _drive_modified_at
         OR (
-            p_drive_modified_at = tgt._drive_modified_at
-            AND p_md5hash > tgt._md5hash
+            p_drive_modified_at = _drive_modified_at
+            AND p_md5hash > _md5hash
         )
     ) THEN
         UPDATE SET
@@ -142,24 +142,16 @@ BEGIN
         );
 
 EXCEPTION WHEN OTHERS THEN
-    DECLARE
-        v_msg TEXT;
-    BEGIN
-        GET STACKED DIAGNOSTICS v_msg = MESSAGE_TEXT;
-        -- Tag data-quality / schema failures so the Step Function can route to DLQ
-        -- without retrying (retrying bad data will never succeed).
-        IF v_msg ILIKE '%invalid%'
-           OR v_msg ILIKE '%out of range%'
-           OR v_msg ILIKE '%type mismatch%'
-           OR v_msg ILIKE '%conversion%'
-           OR v_msg ILIKE '%constraint%'
-           OR v_msg ILIKE '%violat%'
-           OR v_msg ILIKE '%numeric%' THEN
-            RAISE EXCEPTION 'DATA_ERROR | % | source: %', v_msg, p_s3_key;
-        ELSE
-            -- Re-raise as-is; Step Function retry handles transient failures.
-            RAISE;
-        END IF;
-    END;
+    IF SQLERRM ILIKE '%invalid%'
+       OR SQLERRM ILIKE '%out of range%'
+       OR SQLERRM ILIKE '%type mismatch%'
+       OR SQLERRM ILIKE '%conversion%'
+       OR SQLERRM ILIKE '%constraint%'
+       OR SQLERRM ILIKE '%violat%'
+       OR SQLERRM ILIKE '%numeric%' THEN
+        RAISE EXCEPTION 'DATA_ERROR | % | source: %', SQLERRM, p_s3_key;
+    ELSE
+        RAISE;
+    END IF;
 END;
 $$;
