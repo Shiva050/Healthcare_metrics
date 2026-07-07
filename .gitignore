@@ -10,5 +10,6 @@ __pycache__/
 .env
 
 # Lambda packaging artifacts
+package/
 lambda_package/
-gdrive_to_s3.zip
+*.zip
