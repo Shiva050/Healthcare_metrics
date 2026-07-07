@@ -1,0 +1,426 @@
+{
+  "Comment": "PBJ Staffing ingestion: GDrive -> S3 (Bronze) -> Redshift Silver. Replace all ${...} placeholders before deploying.",
+  "StartAt": "InvokeGDriveToS3Lambda",
+  "States": {
+
+    "InvokeGDriveToS3Lambda": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${LambdaArn}",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "processed.$": "$.Payload.processed",
+        "skipped.$":   "$.Payload.skipped",
+        "errors.$":    "$.Payload.errors"
+      },
+      "ResultPath": "$.ingestion",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "HasFilesToProcess"
+    },
+
+    "HasFilesToProcess": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.ingestion.processed[0]",
+          "IsPresent": true,
+          "Next": "ProcessEachFile"
+        }
+      ],
+      "Default": "NoFilesToProcess"
+    },
+
+    "NoFilesToProcess": {
+      "Type": "Succeed"
+    },
+
+    "ProcessEachFile": {
+      "Type": "Map",
+      "ItemsPath": "$.ingestion.processed",
+      "MaxConcurrency": 1,
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "TruncateStagingTable",
+        "States": {
+
+          "TruncateStagingTable": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+            "Parameters": {
+              "ClusterIdentifier": "${RedshiftClusterIdentifier}",
+              "Database":          "${RedshiftDatabase}",
+              "DbUser":            "${RedshiftDbUser}",
+              "Sql":               "TRUNCATE TABLE staging.pbj_daily_nurse_staffing_stg"
+            },
+            "ResultPath": "$.truncate_stmt",
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.truncate_error",
+                "Next": "SendTruncateErrorToDLQ"
+              }
+            ],
+            "Next": "WaitForTruncate"
+          },
+
+          "WaitForTruncate": {
+            "Type": "Wait",
+            "Seconds": 5,
+            "Next": "PollTruncateStatus"
+          },
+
+          "PollTruncateStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+            "Parameters": {
+              "Id.$": "$.truncate_stmt.Id"
+            },
+            "ResultPath": "$.truncate_status",
+            "Next": "IsTruncateComplete"
+          },
+
+          "IsTruncateComplete": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.truncate_status.Status",
+                "StringEquals": "FINISHED",
+                "Next": "CopyToStagingTable"
+              },
+              {
+                "Variable": "$.truncate_status.Status",
+                "StringEquals": "FAILED",
+                "Next": "SendTruncateErrorToDLQ"
+              },
+              {
+                "Variable": "$.truncate_status.Status",
+                "StringEquals": "ABORTED",
+                "Next": "SendTruncateErrorToDLQ"
+              }
+            ],
+            "Default": "WaitForTruncate"
+          },
+
+          "SendTruncateErrorToDLQ": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::sqs:sendMessage",
+            "Parameters": {
+              "QueueUrl": "${DLQUrl}",
+              "MessageGroupId": "truncate-errors",
+              "MessageAttributes": {
+                "error_type": { "DataType": "String", "StringValue": "TRUNCATE_FAILED" },
+                "file_name":  { "DataType": "String", "StringValue.$": "$.file" }
+              },
+              "MessageBody.$": "States.JsonToString($)"
+            },
+            "ResultPath": null,
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "FileHandledViaDLQ"
+          },
+
+          "CopyToStagingTable": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+            "Parameters": {
+              "ClusterIdentifier": "${RedshiftClusterIdentifier}",
+              "Database":          "${RedshiftDatabase}",
+              "DbUser":            "${RedshiftDbUser}",
+              "Sql.$": "States.Format('COPY staging.pbj_daily_nurse_staffing_stg (provnum,provname,city,state,county_name,county_fips,cy_qtr,workdate,mdscensus,hrs_rndon,hrs_rndon_emp,hrs_rndon_ctr,hrs_rnadmin,hrs_rnadmin_emp,hrs_rnadmin_ctr,hrs_rn,hrs_rn_emp,hrs_rn_ctr,hrs_lpnadmin,hrs_lpnadmin_emp,hrs_lpnadmin_ctr,hrs_lpn,hrs_lpn_emp,hrs_lpn_ctr,hrs_cna,hrs_cna_emp,hrs_cna_ctr,hrs_natrn,hrs_natrn_emp,hrs_natrn_ctr,hrs_medaide,hrs_medaide_emp,hrs_medaide_ctr) FROM \\'s3://${S3BucketName}/{}\\' IAM_ROLE \\'${RedshiftIamRoleArn}\\' FORMAT AS CSV IGNOREHEADER 1 BLANKSASNULL EMPTYASNULL MAXERROR 0', $.s3_key)"
+            },
+            "ResultPath": "$.copy_stmt",
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.copy_error",
+                "Next": "SendCopyErrorToDLQ"
+              }
+            ],
+            "Next": "WaitForCopy"
+          },
+
+          "WaitForCopy": {
+            "Type": "Wait",
+            "Seconds": 20,
+            "Next": "PollCopyStatus"
+          },
+
+          "PollCopyStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+            "Parameters": {
+              "Id.$": "$.copy_stmt.Id"
+            },
+            "ResultPath": "$.copy_status",
+            "Next": "IsCopyComplete"
+          },
+
+          "IsCopyComplete": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.copy_status.Status",
+                "StringEquals": "FINISHED",
+                "Next": "MergeToSilver"
+              },
+              {
+                "Variable": "$.copy_status.Status",
+                "StringEquals": "FAILED",
+                "Next": "SendCopyErrorToDLQ"
+              },
+              {
+                "Variable": "$.copy_status.Status",
+                "StringEquals": "ABORTED",
+                "Next": "SendCopyErrorToDLQ"
+              }
+            ],
+            "Default": "WaitForCopy"
+          },
+
+          "SendCopyErrorToDLQ": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::sqs:sendMessage",
+            "Parameters": {
+              "QueueUrl": "${DLQUrl}",
+              "MessageGroupId": "copy-errors",
+              "MessageAttributes": {
+                "error_type": { "DataType": "String", "StringValue": "COPY_FAILED" },
+                "file_name":  { "DataType": "String", "StringValue.$": "$.file" }
+              },
+              "MessageBody.$": "States.JsonToString($)"
+            },
+            "ResultPath": null,
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "FileHandledViaDLQ"
+          },
+
+          "MergeToSilver": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+            "Parameters": {
+              "ClusterIdentifier": "${RedshiftClusterIdentifier}",
+              "Database":          "${RedshiftDatabase}",
+              "DbUser":            "${RedshiftDbUser}",
+              "Sql.$": "States.Format('CALL silver.sp_merge_pbj_staffing(\\'{}\\', \\'{}\\', \\'{}\\')', $.s3_key, $.drive_modified_at, $.md5)"
+            },
+            "ResultPath": "$.merge_stmt",
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 15,
+                "MaxAttempts": 2,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.merge_error",
+                "Next": "SendMergeErrorToDLQ"
+              }
+            ],
+            "Next": "WaitForMerge"
+          },
+
+          "WaitForMerge": {
+            "Type": "Wait",
+            "Seconds": 20,
+            "Next": "PollMergeStatus"
+          },
+
+          "PollMergeStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+            "Parameters": {
+              "Id.$": "$.merge_stmt.Id"
+            },
+            "ResultPath": "$.merge_status",
+            "Next": "IsMergeComplete"
+          },
+
+          "IsMergeComplete": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.merge_status.Status",
+                "StringEquals": "FINISHED",
+                "Next": "CleanupStagingTable"
+              },
+              {
+                "Variable": "$.merge_status.Status",
+                "StringEquals": "ABORTED",
+                "Next": "SendMergeErrorToDLQ"
+              },
+              {
+                "And": [
+                  { "Variable": "$.merge_status.Status", "StringEquals": "FAILED" },
+                  { "Variable": "$.merge_status.Error",  "StringMatches": "*DATA_ERROR*" }
+                ],
+                "Next": "SendMergeErrorToDLQ"
+              },
+              {
+                "Variable": "$.merge_status.Status",
+                "StringEquals": "FAILED",
+                "Next": "RetryMergeToSilver"
+              }
+            ],
+            "Default": "WaitForMerge"
+          },
+
+          "RetryMergeToSilver": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+            "Parameters": {
+              "ClusterIdentifier": "${RedshiftClusterIdentifier}",
+              "Database":          "${RedshiftDatabase}",
+              "DbUser":            "${RedshiftDbUser}",
+              "Sql.$": "States.Format('CALL silver.sp_merge_pbj_staffing(\\'{}\\', \\'{}\\', \\'{}\\')', $.s3_key, $.drive_modified_at, $.md5)"
+            },
+            "ResultPath": "$.merge_stmt",
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 2,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.merge_error",
+                "Next": "SendMergeErrorToDLQ"
+              }
+            ],
+            "Next": "WaitForMerge"
+          },
+
+          "SendMergeErrorToDLQ": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::sqs:sendMessage",
+            "Parameters": {
+              "QueueUrl": "${DLQUrl}",
+              "MessageGroupId": "merge-errors",
+              "MessageAttributes": {
+                "error_type": { "DataType": "String", "StringValue": "MERGE_FAILED" },
+                "file_name":  { "DataType": "String", "StringValue.$": "$.file" }
+              },
+              "MessageBody.$": "States.JsonToString($)"
+            },
+            "ResultPath": null,
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "FileHandledViaDLQ"
+          },
+
+          "CleanupStagingTable": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+            "Parameters": {
+              "ClusterIdentifier": "${RedshiftClusterIdentifier}",
+              "Database":          "${RedshiftDatabase}",
+              "DbUser":            "${RedshiftDbUser}",
+              "Sql":               "TRUNCATE TABLE staging.pbj_daily_nurse_staffing_stg"
+            },
+            "ResultPath": "$.cleanup_stmt",
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": null,
+                "Next": "FileProcessingSuccess"
+              }
+            ],
+            "Next": "WaitForCleanup"
+          },
+
+          "WaitForCleanup": {
+            "Type": "Wait",
+            "Seconds": 5,
+            "Next": "PollCleanupStatus"
+          },
+
+          "PollCleanupStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+            "Parameters": {
+              "Id.$": "$.cleanup_stmt.Id"
+            },
+            "ResultPath": "$.cleanup_status",
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": null,
+                "Next": "FileProcessingSuccess"
+              }
+            ],
+            "Next": "IsCleanupComplete"
+          },
+
+          "IsCleanupComplete": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.cleanup_status.Status",
+                "StringEquals": "FINISHED",
+                "Next": "FileProcessingSuccess"
+              }
+            ],
+            "Default": "WaitForCleanup"
+          },
+
+          "FileProcessingSuccess": {
+            "Type": "Succeed"
+          },
+
+          "FileHandledViaDLQ": {
+            "Type": "Succeed"
+          }
+
+        }
+      },
+      "ResultPath": "$.map_results",
+      "Next": "IngestionComplete"
+    },
+
+    "IngestionComplete": {
+      "Type": "Succeed"
+    }
+
+  }
+}
