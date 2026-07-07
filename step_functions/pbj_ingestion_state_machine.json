@@ -1,5 +1,5 @@
 {
-  "Comment": "PBJ Staffing ingestion: GDrive -> S3 (Bronze) -> Redshift Silver. Replace all ${...} placeholders before deploying.",
+  "Comment": "PBJ Staffing ingestion: GDrive -> S3 (Bronze) -> Redshift Silver.",
   "StartAt": "InvokeGDriveToS3Lambda",
   "States": {
 
@@ -7,7 +7,7 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "FunctionName": "${LambdaArn}",
+        "FunctionName": "arn:aws:lambda:us-east-1:995679261492:function:healthcare-gdrive-to-s3",
         "Payload.$": "$"
       },
       "ResultSelector": {
@@ -56,10 +56,10 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
-              "ClusterIdentifier": "${RedshiftClusterIdentifier}",
-              "Database":          "${RedshiftDatabase}",
-              "DbUser":            "${RedshiftDbUser}",
-              "Sql":               "TRUNCATE TABLE staging.pbj_daily_nurse_staffing_stg"
+              "WorkgroupName": "default",
+              "Database":      "dev",
+              "DbUser":        "admin",
+              "Sql":           "TRUNCATE TABLE staging.pbj_daily_nurse_staffing_stg"
             },
             "ResultPath": "$.truncate_stmt",
             "Retry": [
@@ -122,8 +122,7 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::sqs:sendMessage",
             "Parameters": {
-              "QueueUrl": "${DLQUrl}",
-              "MessageGroupId": "truncate-errors",
+              "QueueUrl": "https://sqs.us-east-1.amazonaws.com/995679261492/health_care_metrics_silver_processing_DLQ",
               "MessageAttributes": {
                 "error_type": { "DataType": "String", "StringValue": "TRUNCATE_FAILED" },
                 "file_name":  { "DataType": "String", "StringValue.$": "$.file" }
@@ -146,10 +145,10 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
-              "ClusterIdentifier": "${RedshiftClusterIdentifier}",
-              "Database":          "${RedshiftDatabase}",
-              "DbUser":            "${RedshiftDbUser}",
-              "Sql.$": "States.Format('COPY staging.pbj_daily_nurse_staffing_stg (provnum,provname,city,state,county_name,county_fips,cy_qtr,workdate,mdscensus,hrs_rndon,hrs_rndon_emp,hrs_rndon_ctr,hrs_rnadmin,hrs_rnadmin_emp,hrs_rnadmin_ctr,hrs_rn,hrs_rn_emp,hrs_rn_ctr,hrs_lpnadmin,hrs_lpnadmin_emp,hrs_lpnadmin_ctr,hrs_lpn,hrs_lpn_emp,hrs_lpn_ctr,hrs_cna,hrs_cna_emp,hrs_cna_ctr,hrs_natrn,hrs_natrn_emp,hrs_natrn_ctr,hrs_medaide,hrs_medaide_emp,hrs_medaide_ctr) FROM \\'s3://${S3BucketName}/{}\\' IAM_ROLE \\'${RedshiftIamRoleArn}\\' FORMAT AS CSV IGNOREHEADER 1 BLANKSASNULL EMPTYASNULL MAXERROR 0', $.s3_key)"
+              "WorkgroupName": "default",
+              "Database":      "dev",
+              "DbUser":        "admin",
+              "Sql.$": "States.Format('COPY staging.pbj_daily_nurse_staffing_stg (provnum,provname,city,state,county_name,county_fips,cy_qtr,workdate,mdscensus,hrs_rndon,hrs_rndon_emp,hrs_rndon_ctr,hrs_rnadmin,hrs_rnadmin_emp,hrs_rnadmin_ctr,hrs_rn,hrs_rn_emp,hrs_rn_ctr,hrs_lpnadmin,hrs_lpnadmin_emp,hrs_lpnadmin_ctr,hrs_lpn,hrs_lpn_emp,hrs_lpn_ctr,hrs_cna,hrs_cna_emp,hrs_cna_ctr,hrs_natrn,hrs_natrn_emp,hrs_natrn_ctr,hrs_medaide,hrs_medaide_emp,hrs_medaide_ctr) FROM \\'s3://health-care-metrics-prj-bronze/{}\\' IAM_ROLE \\'arn:aws:iam::995679261492:role/service-role/AmazonRedshift-CommandsAccessRole-20260706T161330\\' FORMAT AS CSV IGNOREHEADER 1 BLANKSASNULL EMPTYASNULL MAXERROR 0', $.s3_key)"
             },
             "ResultPath": "$.copy_stmt",
             "Catch": [
@@ -204,8 +203,7 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::sqs:sendMessage",
             "Parameters": {
-              "QueueUrl": "${DLQUrl}",
-              "MessageGroupId": "copy-errors",
+              "QueueUrl": "https://sqs.us-east-1.amazonaws.com/995679261492/health_care_metrics_silver_processing_DLQ",
               "MessageAttributes": {
                 "error_type": { "DataType": "String", "StringValue": "COPY_FAILED" },
                 "file_name":  { "DataType": "String", "StringValue.$": "$.file" }
@@ -228,9 +226,9 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
-              "ClusterIdentifier": "${RedshiftClusterIdentifier}",
-              "Database":          "${RedshiftDatabase}",
-              "DbUser":            "${RedshiftDbUser}",
+              "WorkgroupName": "default",
+              "Database":      "dev",
+              "DbUser":        "admin",
               "Sql.$": "States.Format('CALL silver.sp_merge_pbj_staffing(\\'{}\\', \\'{}\\', \\'{}\\')', $.s3_key, $.drive_modified_at, $.md5)"
             },
             "ResultPath": "$.merge_stmt",
@@ -301,9 +299,9 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
-              "ClusterIdentifier": "${RedshiftClusterIdentifier}",
-              "Database":          "${RedshiftDatabase}",
-              "DbUser":            "${RedshiftDbUser}",
+              "WorkgroupName": "default",
+              "Database":      "dev",
+              "DbUser":        "admin",
               "Sql.$": "States.Format('CALL silver.sp_merge_pbj_staffing(\\'{}\\', \\'{}\\', \\'{}\\')', $.s3_key, $.drive_modified_at, $.md5)"
             },
             "ResultPath": "$.merge_stmt",
@@ -329,8 +327,7 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::sqs:sendMessage",
             "Parameters": {
-              "QueueUrl": "${DLQUrl}",
-              "MessageGroupId": "merge-errors",
+              "QueueUrl": "https://sqs.us-east-1.amazonaws.com/995679261492/health_care_metrics_silver_processing_DLQ",
               "MessageAttributes": {
                 "error_type": { "DataType": "String", "StringValue": "MERGE_FAILED" },
                 "file_name":  { "DataType": "String", "StringValue.$": "$.file" }
@@ -353,10 +350,10 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
-              "ClusterIdentifier": "${RedshiftClusterIdentifier}",
-              "Database":          "${RedshiftDatabase}",
-              "DbUser":            "${RedshiftDbUser}",
-              "Sql":               "TRUNCATE TABLE staging.pbj_daily_nurse_staffing_stg"
+              "WorkgroupName": "default",
+              "Database":      "dev",
+              "DbUser":        "admin",
+              "Sql":           "TRUNCATE TABLE staging.pbj_daily_nurse_staffing_stg"
             },
             "ResultPath": "$.cleanup_stmt",
             "Catch": [
