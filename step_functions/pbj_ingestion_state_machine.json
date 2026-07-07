@@ -56,7 +56,7 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
-              "WorkgroupName": "default",
+              "WorkgroupName": "default-workgroup",
               "Database":      "healthcare_metrics",
               "DbUser":        "admin",
               "Sql":           "TRUNCATE TABLE staging.pbj_daily_nurse_staffing_stg"
@@ -145,7 +145,7 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
-              "WorkgroupName": "default",
+              "WorkgroupName": "default-workgroup",
               "Database":      "healthcare_metrics",
               "DbUser":        "admin",
               "Sql.$": "States.Format('COPY staging.pbj_daily_nurse_staffing_stg (provnum,provname,city,state,county_name,county_fips,cy_qtr,workdate,mdscensus,hrs_rndon,hrs_rndon_emp,hrs_rndon_ctr,hrs_rnadmin,hrs_rnadmin_emp,hrs_rnadmin_ctr,hrs_rn,hrs_rn_emp,hrs_rn_ctr,hrs_lpnadmin,hrs_lpnadmin_emp,hrs_lpnadmin_ctr,hrs_lpn,hrs_lpn_emp,hrs_lpn_ctr,hrs_cna,hrs_cna_emp,hrs_cna_ctr,hrs_natrn,hrs_natrn_emp,hrs_natrn_ctr,hrs_medaide,hrs_medaide_emp,hrs_medaide_ctr) FROM \\'s3://health-care-metrics-prj-bronze/{}\\' IAM_ROLE \\'arn:aws:iam::995679261492:role/service-role/AmazonRedshift-CommandsAccessRole-20260706T161330\\' FORMAT AS CSV IGNOREHEADER 1 BLANKSASNULL EMPTYASNULL MAXERROR 0', $.s3_key)"
@@ -226,7 +226,7 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
-              "WorkgroupName": "default",
+              "WorkgroupName": "default-workgroup",
               "Database":      "healthcare_metrics",
               "DbUser":        "admin",
               "Sql.$": "States.Format('CALL silver.sp_merge_pbj_staffing(\\'{}\\', \\'{}\\', \\'{}\\')', $.s3_key, $.drive_modified_at, $.md5)"
@@ -299,7 +299,7 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
-              "WorkgroupName": "default",
+              "WorkgroupName": "default-workgroup",
               "Database":      "healthcare_metrics",
               "DbUser":        "admin",
               "Sql.$": "States.Format('CALL silver.sp_merge_pbj_staffing(\\'{}\\', \\'{}\\', \\'{}\\')', $.s3_key, $.drive_modified_at, $.md5)"
@@ -350,7 +350,7 @@
             "Type": "Task",
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
-              "WorkgroupName": "default",
+              "WorkgroupName": "default-workgroup",
               "Database":      "healthcare_metrics",
               "DbUser":        "admin",
               "Sql":           "TRUNCATE TABLE staging.pbj_daily_nurse_staffing_stg"
