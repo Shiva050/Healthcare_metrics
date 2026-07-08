@@ -1,0 +1,550 @@
+{
+  "Comment": "PBJ Staffing ingestion: GDrive -> S3 (Bronze) -> Redshift Silver. SQL is bound via Parameters (not string-interpolated) to avoid injecting unsanitized S3 keys into generated SQL. Every terminal path (success or DLQ) writes merge_status back to the DynamoDB control table so a merge failure after the Lambda has already recorded the file's md5 doesn't get silently skipped on the next run. The merge retry is bounded to one extra attempt before falling through to the DLQ.",
+  "StartAt": "InvokeGDriveToS3Lambda",
+  "States": {
+
+    "InvokeGDriveToS3Lambda": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "arn:aws:lambda:us-east-1:995679261492:function:healthcare-gdrive-to-s3",
+        "Payload.$": "$"
+      },
+      "ResultSelector": {
+        "processed.$": "$.Payload.processed",
+        "skipped.$":   "$.Payload.skipped",
+        "errors.$":    "$.Payload.errors"
+      },
+      "ResultPath": "$.ingestion",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "HasFilesToProcess"
+    },
+
+    "HasFilesToProcess": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.ingestion.processed[0]",
+          "IsPresent": true,
+          "Next": "ProcessEachFile"
+        }
+      ],
+      "Default": "NoFilesToProcess"
+    },
+
+    "NoFilesToProcess": {
+      "Type": "Succeed"
+    },
+
+    "ProcessEachFile": {
+      "Type": "Map",
+      "ItemsPath": "$.ingestion.processed",
+      "MaxConcurrency": 1,
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "TruncateStagingTable",
+        "States": {
+
+          "TruncateStagingTable": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+            "Parameters": {
+              "WorkgroupName": "default-workgroup",
+              "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
+              "Database":      "healthcare_metrics",
+              "Sql":           "TRUNCATE TABLE staging.pbj_daily_nurse_staffing_stg"
+            },
+            "ResultPath": "$.truncate_stmt",
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.truncate_error",
+                "Next": "MarkTruncateFailedInDynamo"
+              }
+            ],
+            "Next": "WaitForTruncate"
+          },
+
+          "WaitForTruncate": {
+            "Type": "Wait",
+            "Seconds": 5,
+            "Next": "PollTruncateStatus"
+          },
+
+          "PollTruncateStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+            "Parameters": {
+              "Id.$": "$.truncate_stmt.Id"
+            },
+            "ResultPath": "$.truncate_status",
+            "Next": "IsTruncateComplete"
+          },
+
+          "IsTruncateComplete": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.truncate_status.Status",
+                "StringEquals": "FINISHED",
+                "Next": "CopyToStagingTable"
+              },
+              {
+                "Variable": "$.truncate_status.Status",
+                "StringEquals": "FAILED",
+                "Next": "MarkTruncateFailedInDynamo"
+              },
+              {
+                "Variable": "$.truncate_status.Status",
+                "StringEquals": "ABORTED",
+                "Next": "MarkTruncateFailedInDynamo"
+              }
+            ],
+            "Default": "WaitForTruncate"
+          },
+
+          "MarkTruncateFailedInDynamo": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "healthcare_metrics_source_drive_ledger",
+              "Key": { "file_id": { "S.$": "$.file_id" } },
+              "UpdateExpression": "SET merge_status = :status",
+              "ExpressionAttributeValues": { ":status": { "S": "FAILED" } }
+            },
+            "ResultPath": null,
+            "Retry": [
+              { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }
+            ],
+            "Catch": [
+              { "ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "SendTruncateErrorToDLQ" }
+            ],
+            "Next": "SendTruncateErrorToDLQ"
+          },
+
+          "SendTruncateErrorToDLQ": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::sqs:sendMessage",
+            "Parameters": {
+              "QueueUrl": "https://sqs.us-east-1.amazonaws.com/995679261492/health_care_metrics_silver_processing_DLQ",
+              "MessageAttributes": {
+                "error_type": { "DataType": "String", "StringValue": "TRUNCATE_FAILED" },
+                "file_name":  { "DataType": "String", "StringValue.$": "$.file" }
+              },
+              "MessageBody.$": "States.JsonToString($)"
+            },
+            "ResultPath": null,
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "FileHandledViaDLQ"
+          },
+
+          "CopyToStagingTable": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+            "Parameters": {
+              "WorkgroupName": "default-workgroup",
+              "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
+              "Database":      "healthcare_metrics",
+              "Sql": "CALL staging.sp_copy_pbj_staffing(:s3_key)",
+              "Parameters": [
+                { "Name": "s3_key", "Value.$": "$.s3_key" }
+              ]
+            },
+            "ResultPath": "$.copy_stmt",
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.copy_error",
+                "Next": "MarkCopyFailedInDynamo"
+              }
+            ],
+            "Next": "WaitForCopy"
+          },
+
+          "WaitForCopy": {
+            "Type": "Wait",
+            "Seconds": 20,
+            "Next": "PollCopyStatus"
+          },
+
+          "PollCopyStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+            "Parameters": {
+              "Id.$": "$.copy_stmt.Id"
+            },
+            "ResultPath": "$.copy_status",
+            "Next": "IsCopyComplete"
+          },
+
+          "IsCopyComplete": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.copy_status.Status",
+                "StringEquals": "FINISHED",
+                "Next": "MergeToSilver"
+              },
+              {
+                "Variable": "$.copy_status.Status",
+                "StringEquals": "FAILED",
+                "Next": "MarkCopyFailedInDynamo"
+              },
+              {
+                "Variable": "$.copy_status.Status",
+                "StringEquals": "ABORTED",
+                "Next": "MarkCopyFailedInDynamo"
+              }
+            ],
+            "Default": "WaitForCopy"
+          },
+
+          "MarkCopyFailedInDynamo": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "healthcare_metrics_source_drive_ledger",
+              "Key": { "file_id": { "S.$": "$.file_id" } },
+              "UpdateExpression": "SET merge_status = :status",
+              "ExpressionAttributeValues": { ":status": { "S": "FAILED" } }
+            },
+            "ResultPath": null,
+            "Retry": [
+              { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }
+            ],
+            "Catch": [
+              { "ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "SendCopyErrorToDLQ" }
+            ],
+            "Next": "SendCopyErrorToDLQ"
+          },
+
+          "SendCopyErrorToDLQ": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::sqs:sendMessage",
+            "Parameters": {
+              "QueueUrl": "https://sqs.us-east-1.amazonaws.com/995679261492/health_care_metrics_silver_processing_DLQ",
+              "MessageAttributes": {
+                "error_type": { "DataType": "String", "StringValue": "COPY_FAILED" },
+                "file_name":  { "DataType": "String", "StringValue.$": "$.file" }
+              },
+              "MessageBody.$": "States.JsonToString($)"
+            },
+            "ResultPath": null,
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "FileHandledViaDLQ"
+          },
+
+          "MergeToSilver": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+            "Parameters": {
+              "WorkgroupName": "default-workgroup",
+              "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
+              "Database":      "healthcare_metrics",
+              "Sql": "CALL silver.sp_merge_pbj_staffing(:s3_key, :modified_at, :md5)",
+              "Parameters": [
+                { "Name": "s3_key", "Value.$": "$.s3_key" },
+                { "Name": "modified_at", "Value.$": "$.drive_modified_at" },
+                { "Name": "md5", "Value.$": "$.md5" }
+              ]
+            },
+            "ResultPath": "$.merge_stmt",
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 15,
+                "MaxAttempts": 2,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.merge_error",
+                "Next": "MarkMergeFailedInDynamo"
+              }
+            ],
+            "Next": "WaitForMerge"
+          },
+
+          "WaitForMerge": {
+            "Type": "Wait",
+            "Seconds": 20,
+            "Next": "PollMergeStatus"
+          },
+
+          "PollMergeStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+            "Parameters": {
+              "Id.$": "$.merge_stmt.Id"
+            },
+            "ResultPath": "$.merge_status",
+            "Next": "IsMergeComplete"
+          },
+
+          "IsMergeComplete": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.merge_status.Status",
+                "StringEquals": "FINISHED",
+                "Next": "MarkMergeSuccessInDynamo"
+              },
+              {
+                "Variable": "$.merge_status.Status",
+                "StringEquals": "ABORTED",
+                "Next": "MarkMergeFailedInDynamo"
+              },
+              {
+                "And": [
+                  { "Variable": "$.merge_status.Status", "StringEquals": "FAILED" },
+                  { "Variable": "$.merge_status.Error",  "StringMatches": "*DATA_ERROR*" }
+                ],
+                "Next": "MarkMergeFailedInDynamo"
+              },
+              {
+                "Variable": "$.merge_status.Status",
+                "StringEquals": "FAILED",
+                "Next": "RetryMergeToSilver"
+              }
+            ],
+            "Default": "WaitForMerge"
+          },
+
+          "RetryMergeToSilver": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+            "Parameters": {
+              "WorkgroupName": "default-workgroup",
+              "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
+              "Database":      "healthcare_metrics",
+              "Sql": "CALL silver.sp_merge_pbj_staffing(:s3_key, :modified_at, :md5)",
+              "Parameters": [
+                { "Name": "s3_key", "Value.$": "$.s3_key" },
+                { "Name": "modified_at", "Value.$": "$.drive_modified_at" },
+                { "Name": "md5", "Value.$": "$.md5" }
+              ]
+            },
+            "ResultPath": "$.merge_stmt",
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 2,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.merge_error",
+                "Next": "MarkMergeFailedInDynamo"
+              }
+            ],
+            "Next": "WaitForMergeRetry"
+          },
+
+          "WaitForMergeRetry": {
+            "Type": "Wait",
+            "Seconds": 20,
+            "Next": "PollMergeRetryStatus"
+          },
+
+          "PollMergeRetryStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+            "Parameters": {
+              "Id.$": "$.merge_stmt.Id"
+            },
+            "ResultPath": "$.merge_status",
+            "Next": "IsMergeRetryComplete"
+          },
+
+          "IsMergeRetryComplete": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.merge_status.Status",
+                "StringEquals": "FINISHED",
+                "Next": "MarkMergeSuccessInDynamo"
+              },
+              {
+                "Variable": "$.merge_status.Status",
+                "StringEquals": "ABORTED",
+                "Next": "MarkMergeFailedInDynamo"
+              },
+              {
+                "Variable": "$.merge_status.Status",
+                "StringEquals": "FAILED",
+                "Next": "MarkMergeFailedInDynamo"
+              }
+            ],
+            "Default": "WaitForMergeRetry"
+          },
+
+          "MarkMergeFailedInDynamo": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "healthcare_metrics_source_drive_ledger",
+              "Key": { "file_id": { "S.$": "$.file_id" } },
+              "UpdateExpression": "SET merge_status = :status",
+              "ExpressionAttributeValues": { ":status": { "S": "FAILED" } }
+            },
+            "ResultPath": null,
+            "Retry": [
+              { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }
+            ],
+            "Catch": [
+              { "ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "SendMergeErrorToDLQ" }
+            ],
+            "Next": "SendMergeErrorToDLQ"
+          },
+
+          "SendMergeErrorToDLQ": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::sqs:sendMessage",
+            "Parameters": {
+              "QueueUrl": "https://sqs.us-east-1.amazonaws.com/995679261492/health_care_metrics_silver_processing_DLQ",
+              "MessageAttributes": {
+                "error_type": { "DataType": "String", "StringValue": "MERGE_FAILED" },
+                "file_name":  { "DataType": "String", "StringValue.$": "$.file" }
+              },
+              "MessageBody.$": "States.JsonToString($)"
+            },
+            "ResultPath": null,
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "FileHandledViaDLQ"
+          },
+
+          "MarkMergeSuccessInDynamo": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "healthcare_metrics_source_drive_ledger",
+              "Key": { "file_id": { "S.$": "$.file_id" } },
+              "UpdateExpression": "SET merge_status = :status",
+              "ExpressionAttributeValues": { ":status": { "S": "SUCCESS" } }
+            },
+            "ResultPath": null,
+            "Retry": [
+              { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }
+            ],
+            "Catch": [
+              { "ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "CleanupStagingTable" }
+            ],
+            "Next": "CleanupStagingTable"
+          },
+
+          "CleanupStagingTable": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+            "Parameters": {
+              "WorkgroupName": "default-workgroup",
+              "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
+              "Database":      "healthcare_metrics",
+              "Sql":           "TRUNCATE TABLE staging.pbj_daily_nurse_staffing_stg"
+            },
+            "ResultPath": "$.cleanup_stmt",
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": null,
+                "Next": "FileProcessingSuccess"
+              }
+            ],
+            "Next": "WaitForCleanup"
+          },
+
+          "WaitForCleanup": {
+            "Type": "Wait",
+            "Seconds": 5,
+            "Next": "PollCleanupStatus"
+          },
+
+          "PollCleanupStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+            "Parameters": {
+              "Id.$": "$.cleanup_stmt.Id"
+            },
+            "ResultPath": "$.cleanup_status",
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": null,
+                "Next": "FileProcessingSuccess"
+              }
+            ],
+            "Next": "IsCleanupComplete"
+          },
+
+          "IsCleanupComplete": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.cleanup_status.Status",
+                "StringEquals": "FINISHED",
+                "Next": "FileProcessingSuccess"
+              }
+            ],
+            "Default": "WaitForCleanup"
+          },
+
+          "FileProcessingSuccess": {
+            "Type": "Succeed"
+          },
+
+          "FileHandledViaDLQ": {
+            "Type": "Succeed"
+          }
+
+        }
+      },
+      "ResultPath": "$.map_results",
+      "Next": "IngestionComplete"
+    },
+
+    "IngestionComplete": {
+      "Type": "Succeed"
+    }
+
+  }
+}
