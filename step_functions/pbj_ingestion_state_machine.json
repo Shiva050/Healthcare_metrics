@@ -57,8 +57,8 @@
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
               "WorkgroupName": "default-workgroup",
+              "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
               "Database":      "healthcare_metrics",
-              "DbUser":        "admin",
               "Sql":           "TRUNCATE TABLE staging.pbj_daily_nurse_staffing_stg"
             },
             "ResultPath": "$.truncate_stmt",
@@ -165,11 +165,11 @@
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
               "WorkgroupName": "default-workgroup",
+              "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
               "Database":      "healthcare_metrics",
-              "DbUser":        "admin",
-              "Sql": "COPY staging.pbj_daily_nurse_staffing_stg (provnum,provname,city,state,county_name,county_fips,cy_qtr,workdate,mdscensus,hrs_rndon,hrs_rndon_emp,hrs_rndon_ctr,hrs_rnadmin,hrs_rnadmin_emp,hrs_rnadmin_ctr,hrs_rn,hrs_rn_emp,hrs_rn_ctr,hrs_lpnadmin,hrs_lpnadmin_emp,hrs_lpnadmin_ctr,hrs_lpn,hrs_lpn_emp,hrs_lpn_ctr,hrs_cna,hrs_cna_emp,hrs_cna_ctr,hrs_natrn,hrs_natrn_emp,hrs_natrn_ctr,hrs_medaide,hrs_medaide_emp,hrs_medaide_ctr) FROM :s3_uri IAM_ROLE 'arn:aws:iam::995679261492:role/service-role/AmazonRedshift-CommandsAccessRole-20260706T161330' FORMAT AS CSV IGNOREHEADER 1 BLANKSASNULL EMPTYASNULL MAXERROR 0",
+              "Sql": "CALL staging.sp_copy_pbj_staffing(:s3_key)",
               "Parameters": [
-                { "Name": "s3_uri", "Value.$": "States.Format('s3://health-care-metrics-prj-bronze/{}', $.s3_key)" }
+                { "Name": "s3_key", "Value.$": "$.s3_key" }
               ]
             },
             "ResultPath": "$.copy_stmt",
@@ -268,8 +268,8 @@
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
               "WorkgroupName": "default-workgroup",
+              "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
               "Database":      "healthcare_metrics",
-              "DbUser":        "admin",
               "Sql": "CALL silver.sp_merge_pbj_staffing(:s3_key, :modified_at, :md5)",
               "Parameters": [
                 { "Name": "s3_key", "Value.$": "$.s3_key" },
@@ -346,8 +346,8 @@
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
               "WorkgroupName": "default-workgroup",
+              "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
               "Database":      "healthcare_metrics",
-              "DbUser":        "admin",
               "Sql": "CALL silver.sp_merge_pbj_staffing(:s3_key, :modified_at, :md5)",
               "Parameters": [
                 { "Name": "s3_key", "Value.$": "$.s3_key" },
@@ -478,8 +478,8 @@
             "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
             "Parameters": {
               "WorkgroupName": "default-workgroup",
+              "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
               "Database":      "healthcare_metrics",
-              "DbUser":        "admin",
               "Sql":           "TRUNCATE TABLE staging.pbj_daily_nurse_staffing_stg"
             },
             "ResultPath": "$.cleanup_stmt",
