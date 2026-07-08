@@ -1,5 +1,5 @@
 {
-  "Comment": "PBJ Staffing ingestion: GDrive -> S3 (Bronze) -> Redshift Silver.",
+  "Comment": "PBJ Staffing ingestion: GDrive -> S3 (Bronze) -> Redshift Silver. SQL is bound via Parameters (not string-interpolated) to avoid injecting unsanitized S3 keys into generated SQL. Every terminal path (success or DLQ) writes merge_status back to the DynamoDB control table so a merge failure after the Lambda has already recorded the file's md5 doesn't get silently skipped on the next run. The merge retry is bounded to one extra attempt before falling through to the DLQ.",
   "StartAt": "InvokeGDriveToS3Lambda",
   "States": {
 
@@ -74,7 +74,7 @@
               {
                 "ErrorEquals": ["States.ALL"],
                 "ResultPath": "$.truncate_error",
-                "Next": "SendTruncateErrorToDLQ"
+                "Next": "MarkTruncateFailedInDynamo"
               }
             ],
             "Next": "WaitForTruncate"
@@ -107,15 +107,34 @@
               {
                 "Variable": "$.truncate_status.Status",
                 "StringEquals": "FAILED",
-                "Next": "SendTruncateErrorToDLQ"
+                "Next": "MarkTruncateFailedInDynamo"
               },
               {
                 "Variable": "$.truncate_status.Status",
                 "StringEquals": "ABORTED",
-                "Next": "SendTruncateErrorToDLQ"
+                "Next": "MarkTruncateFailedInDynamo"
               }
             ],
             "Default": "WaitForTruncate"
+          },
+
+          "MarkTruncateFailedInDynamo": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "healthcare_metrics_source_drive_ledger",
+              "Key": { "file_id": { "S.$": "$.file_id" } },
+              "UpdateExpression": "SET merge_status = :status",
+              "ExpressionAttributeValues": { ":status": { "S": "FAILED" } }
+            },
+            "ResultPath": null,
+            "Retry": [
+              { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }
+            ],
+            "Catch": [
+              { "ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "SendTruncateErrorToDLQ" }
+            ],
+            "Next": "SendTruncateErrorToDLQ"
           },
 
           "SendTruncateErrorToDLQ": {
@@ -148,14 +167,17 @@
               "WorkgroupName": "default-workgroup",
               "Database":      "healthcare_metrics",
               "DbUser":        "admin",
-              "Sql.$": "States.Format('COPY staging.pbj_daily_nurse_staffing_stg (provnum,provname,city,state,county_name,county_fips,cy_qtr,workdate,mdscensus,hrs_rndon,hrs_rndon_emp,hrs_rndon_ctr,hrs_rnadmin,hrs_rnadmin_emp,hrs_rnadmin_ctr,hrs_rn,hrs_rn_emp,hrs_rn_ctr,hrs_lpnadmin,hrs_lpnadmin_emp,hrs_lpnadmin_ctr,hrs_lpn,hrs_lpn_emp,hrs_lpn_ctr,hrs_cna,hrs_cna_emp,hrs_cna_ctr,hrs_natrn,hrs_natrn_emp,hrs_natrn_ctr,hrs_medaide,hrs_medaide_emp,hrs_medaide_ctr) FROM \\'s3://health-care-metrics-prj-bronze/{}\\' IAM_ROLE \\'arn:aws:iam::995679261492:role/service-role/AmazonRedshift-CommandsAccessRole-20260706T161330\\' FORMAT AS CSV IGNOREHEADER 1 BLANKSASNULL EMPTYASNULL MAXERROR 0', $.s3_key)"
+              "Sql": "COPY staging.pbj_daily_nurse_staffing_stg (provnum,provname,city,state,county_name,county_fips,cy_qtr,workdate,mdscensus,hrs_rndon,hrs_rndon_emp,hrs_rndon_ctr,hrs_rnadmin,hrs_rnadmin_emp,hrs_rnadmin_ctr,hrs_rn,hrs_rn_emp,hrs_rn_ctr,hrs_lpnadmin,hrs_lpnadmin_emp,hrs_lpnadmin_ctr,hrs_lpn,hrs_lpn_emp,hrs_lpn_ctr,hrs_cna,hrs_cna_emp,hrs_cna_ctr,hrs_natrn,hrs_natrn_emp,hrs_natrn_ctr,hrs_medaide,hrs_medaide_emp,hrs_medaide_ctr) FROM :s3_uri IAM_ROLE 'arn:aws:iam::995679261492:role/service-role/AmazonRedshift-CommandsAccessRole-20260706T161330' FORMAT AS CSV IGNOREHEADER 1 BLANKSASNULL EMPTYASNULL MAXERROR 0",
+              "Parameters": [
+                { "Name": "s3_uri", "Value.$": "States.Format('s3://health-care-metrics-prj-bronze/{}', $.s3_key)" }
+              ]
             },
             "ResultPath": "$.copy_stmt",
             "Catch": [
               {
                 "ErrorEquals": ["States.ALL"],
                 "ResultPath": "$.copy_error",
-                "Next": "SendCopyErrorToDLQ"
+                "Next": "MarkCopyFailedInDynamo"
               }
             ],
             "Next": "WaitForCopy"
@@ -188,15 +210,34 @@
               {
                 "Variable": "$.copy_status.Status",
                 "StringEquals": "FAILED",
-                "Next": "SendCopyErrorToDLQ"
+                "Next": "MarkCopyFailedInDynamo"
               },
               {
                 "Variable": "$.copy_status.Status",
                 "StringEquals": "ABORTED",
-                "Next": "SendCopyErrorToDLQ"
+                "Next": "MarkCopyFailedInDynamo"
               }
             ],
             "Default": "WaitForCopy"
+          },
+
+          "MarkCopyFailedInDynamo": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "healthcare_metrics_source_drive_ledger",
+              "Key": { "file_id": { "S.$": "$.file_id" } },
+              "UpdateExpression": "SET merge_status = :status",
+              "ExpressionAttributeValues": { ":status": { "S": "FAILED" } }
+            },
+            "ResultPath": null,
+            "Retry": [
+              { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }
+            ],
+            "Catch": [
+              { "ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "SendCopyErrorToDLQ" }
+            ],
+            "Next": "SendCopyErrorToDLQ"
           },
 
           "SendCopyErrorToDLQ": {
@@ -229,7 +270,12 @@
               "WorkgroupName": "default-workgroup",
               "Database":      "healthcare_metrics",
               "DbUser":        "admin",
-              "Sql.$": "States.Format('CALL silver.sp_merge_pbj_staffing(\\'{}\\', \\'{}\\', \\'{}\\')', $.s3_key, $.drive_modified_at, $.md5)"
+              "Sql": "CALL silver.sp_merge_pbj_staffing(:s3_key, :modified_at, :md5)",
+              "Parameters": [
+                { "Name": "s3_key", "Value.$": "$.s3_key" },
+                { "Name": "modified_at", "Value.$": "$.drive_modified_at" },
+                { "Name": "md5", "Value.$": "$.md5" }
+              ]
             },
             "ResultPath": "$.merge_stmt",
             "Retry": [
@@ -244,7 +290,7 @@
               {
                 "ErrorEquals": ["States.ALL"],
                 "ResultPath": "$.merge_error",
-                "Next": "SendMergeErrorToDLQ"
+                "Next": "MarkMergeFailedInDynamo"
               }
             ],
             "Next": "WaitForMerge"
@@ -272,19 +318,19 @@
               {
                 "Variable": "$.merge_status.Status",
                 "StringEquals": "FINISHED",
-                "Next": "CleanupStagingTable"
+                "Next": "MarkMergeSuccessInDynamo"
               },
               {
                 "Variable": "$.merge_status.Status",
                 "StringEquals": "ABORTED",
-                "Next": "SendMergeErrorToDLQ"
+                "Next": "MarkMergeFailedInDynamo"
               },
               {
                 "And": [
                   { "Variable": "$.merge_status.Status", "StringEquals": "FAILED" },
                   { "Variable": "$.merge_status.Error",  "StringMatches": "*DATA_ERROR*" }
                 ],
-                "Next": "SendMergeErrorToDLQ"
+                "Next": "MarkMergeFailedInDynamo"
               },
               {
                 "Variable": "$.merge_status.Status",
@@ -302,7 +348,12 @@
               "WorkgroupName": "default-workgroup",
               "Database":      "healthcare_metrics",
               "DbUser":        "admin",
-              "Sql.$": "States.Format('CALL silver.sp_merge_pbj_staffing(\\'{}\\', \\'{}\\', \\'{}\\')', $.s3_key, $.drive_modified_at, $.md5)"
+              "Sql": "CALL silver.sp_merge_pbj_staffing(:s3_key, :modified_at, :md5)",
+              "Parameters": [
+                { "Name": "s3_key", "Value.$": "$.s3_key" },
+                { "Name": "modified_at", "Value.$": "$.drive_modified_at" },
+                { "Name": "md5", "Value.$": "$.md5" }
+              ]
             },
             "ResultPath": "$.merge_stmt",
             "Retry": [
@@ -317,10 +368,67 @@
               {
                 "ErrorEquals": ["States.ALL"],
                 "ResultPath": "$.merge_error",
-                "Next": "SendMergeErrorToDLQ"
+                "Next": "MarkMergeFailedInDynamo"
               }
             ],
-            "Next": "WaitForMerge"
+            "Next": "WaitForMergeRetry"
+          },
+
+          "WaitForMergeRetry": {
+            "Type": "Wait",
+            "Seconds": 20,
+            "Next": "PollMergeRetryStatus"
+          },
+
+          "PollMergeRetryStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+            "Parameters": {
+              "Id.$": "$.merge_stmt.Id"
+            },
+            "ResultPath": "$.merge_status",
+            "Next": "IsMergeRetryComplete"
+          },
+
+          "IsMergeRetryComplete": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.merge_status.Status",
+                "StringEquals": "FINISHED",
+                "Next": "MarkMergeSuccessInDynamo"
+              },
+              {
+                "Variable": "$.merge_status.Status",
+                "StringEquals": "ABORTED",
+                "Next": "MarkMergeFailedInDynamo"
+              },
+              {
+                "Variable": "$.merge_status.Status",
+                "StringEquals": "FAILED",
+                "Next": "MarkMergeFailedInDynamo"
+              }
+            ],
+            "Default": "WaitForMergeRetry"
+          },
+
+          "MarkMergeFailedInDynamo": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "healthcare_metrics_source_drive_ledger",
+              "Key": { "file_id": { "S.$": "$.file_id" } },
+              "UpdateExpression": "SET merge_status = :status",
+              "ExpressionAttributeValues": { ":status": { "S": "FAILED" } }
+            },
+            "ResultPath": null,
+            "Retry": [
+              { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }
+            ],
+            "Catch": [
+              { "ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "SendMergeErrorToDLQ" }
+            ],
+            "Next": "SendMergeErrorToDLQ"
           },
 
           "SendMergeErrorToDLQ": {
@@ -344,6 +452,25 @@
               }
             ],
             "Next": "FileHandledViaDLQ"
+          },
+
+          "MarkMergeSuccessInDynamo": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+            "Parameters": {
+              "TableName": "healthcare_metrics_source_drive_ledger",
+              "Key": { "file_id": { "S.$": "$.file_id" } },
+              "UpdateExpression": "SET merge_status = :status",
+              "ExpressionAttributeValues": { ":status": { "S": "SUCCESS" } }
+            },
+            "ResultPath": null,
+            "Retry": [
+              { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }
+            ],
+            "Catch": [
+              { "ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "CleanupStagingTable" }
+            ],
+            "Next": "CleanupStagingTable"
           },
 
           "CleanupStagingTable": {

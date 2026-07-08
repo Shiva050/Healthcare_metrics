@@ -5,14 +5,22 @@ Flow per file found in the target Drive folder:
   1. List CSV files from Google Drive folder (including modifiedTime)
   2. For each file, compute MD5 hash of its content
   3. Look up the file_id in the DynamoDB control table
-     - Not found           -> new file, download + upload to S3
-     - Found, same md5     -> already processed, unchanged -> skip
-     - Found, different md5-> content changed -> re-download + upload to S3
+     - Not found                        -> new file, download + upload to S3
+     - Found, same md5, merge_status=SUCCESS -> already landed in Silver -> skip
+     - Found, same md5, merge_status!=SUCCESS -> content unchanged but the
+       last Redshift merge never completed (or we don't know that it did) ->
+       re-offer it so the Step Function retries the merge
+     - Found, different md5             -> content changed -> re-download + upload
   4. Upload to S3 as  <original_name>_<YYYYMMDD_HHMMSS>.csv
      (timestamp derived from Drive modifiedTime, not processing time)
-  5. Upsert the control table with latest file_id, md5, drive_modified_at, s3_key
-  6. Return summary["processed"] entries include drive_modified_at and md5
-     for downstream Step Function → Redshift MERGE flow
+  5. Upsert the control table with latest file_id, md5, drive_modified_at,
+     s3_key, and merge_status=PENDING — the Step Function flips this to
+     SUCCESS/FAILED once it knows whether the Redshift merge actually landed,
+     so a merge failure after this Lambda has already run doesn't silently
+     get skipped as "already processed" next time.
+  6. Return summary["processed"] entries include file_id, drive_modified_at,
+     and md5 for the downstream Step Function -> Redshift MERGE flow (it
+     needs file_id to update this same DynamoDB record's merge_status)
 
 Placeholders (replace before deploy):
   DRIVE_FOLDER_ID   - Google Drive folder ID
@@ -52,6 +60,13 @@ ATTR_MD5            = "md5hash"
 ATTR_S3_KEY         = "s3_key"
 ATTR_DRIVE_MODIFIED = "drive_modified_at" # ISO-8601 from Drive API
 ATTR_FILE_NAME      = "file_name"
+ATTR_MERGE_STATUS   = "merge_status"      # PENDING | SUCCESS | FAILED — set by
+                                           # this Lambda (PENDING) and by the
+                                           # Step Function once the Redshift
+                                           # merge finishes (SUCCESS/FAILED)
+
+MERGE_STATUS_PENDING = "PENDING"
+MERGE_STATUS_SUCCESS = "SUCCESS"
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -124,12 +139,16 @@ def _get_control_record(table, file_id: str):
 
 def _upsert_control_record(table, file_id: str, file_name: str,
                             md5: str, s3_key: str, drive_modified_at: str):
+    # Always PENDING here: we're only ever called right before handing the
+    # file off for merging, so we can't yet know whether that merge will
+    # succeed. The Step Function is what flips this to SUCCESS/FAILED.
     table.put_item(Item={
         ATTR_FILE_ID:        file_id,
         ATTR_FILE_NAME:      file_name,
         ATTR_MD5:            md5,
         ATTR_S3_KEY:         s3_key,
         ATTR_DRIVE_MODIFIED: drive_modified_at,
+        ATTR_MERGE_STATUS:   MERGE_STATUS_PENDING,
     })
 
 
@@ -172,10 +191,17 @@ def lambda_handler(event, context):
             current_md5 = _md5(data)
 
             if record:
-                if record[ATTR_MD5] == current_md5:
-                    logger.info("SKIP %s — unchanged (md5 match)", file_name)
+                unchanged = record[ATTR_MD5] == current_md5
+                already_merged = record.get(ATTR_MERGE_STATUS) == MERGE_STATUS_SUCCESS
+                if unchanged and already_merged:
+                    logger.info("SKIP %s — unchanged (md5 match) and already merged", file_name)
                     summary["skipped"].append(file_name)
                     continue
+                elif unchanged:
+                    logger.info(
+                        "RETRY %s — unchanged content but merge_status=%s, reprocessing",
+                        file_name, record.get(ATTR_MERGE_STATUS, "<missing>"),
+                    )
                 else:
                     logger.info(
                         "CHANGED %s — md5 %s -> %s",
@@ -201,6 +227,7 @@ def lambda_handler(event, context):
                 drive_modified_at=drive_modified_at,
             )
             summary["processed"].append({
+                "file_id":           file_id,
                 "file":              file_name,
                 "s3_key":            s3_key,
                 "drive_modified_at": drive_modified_at,
