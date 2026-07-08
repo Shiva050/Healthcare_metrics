@@ -12,6 +12,17 @@
 --              GREATER (covers the edge case of same-timestamp, same-batch,
 --              different-content files).
 --
+-- Redshift's MERGE only supports a plain WHEN MATCHED with no condition of
+-- its own ("Additional predicate in WHEN MATCHED clause is not supported"),
+-- and its USING source cannot reference the target table at all, even via a
+-- LEFT JOIN for filtering ("Source view/subquery in Merge statement cannot
+-- reference target table") — both confirmed against the live cluster, not
+-- assumed. So the win-rule filtering has to happen as its own statement
+-- before the MERGE ever runs: a temp table is populated first (via a plain
+-- SELECT that's free to join staging against the target), and MERGE then
+-- reads from that temp table, which by construction contains only rows
+-- that should either insert or overwrite.
+--
 -- Error classification (for Step Function DLQ routing):
 --   DATA_ERROR prefix  → bad data / schema mismatch → needs human review
 --   anything else      → transient; Step Function retries
@@ -25,57 +36,32 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
 
+    CREATE TEMP TABLE IF NOT EXISTS tmp_pbj_merge_src (LIKE staging.pbj_daily_nurse_staffing_stg);
+    DELETE FROM tmp_pbj_merge_src;
+
+    INSERT INTO tmp_pbj_merge_src
+    SELECT s.*
+    FROM staging.pbj_daily_nurse_staffing_stg s
+    LEFT JOIN silver.pbj_daily_nurse_staffing t
+           ON t.provnum  = s.provnum
+          AND t.workdate = s.workdate
+    WHERE s.provnum IS NOT NULL
+      AND s.workdate IS NOT NULL
+      AND (
+            t.provnum IS NULL
+         OR p_drive_modified_at > t._drive_modified_at
+         OR (
+                p_drive_modified_at = t._drive_modified_at
+            AND p_md5hash > t._md5hash
+            )
+          );
+
     MERGE INTO silver.pbj_daily_nurse_staffing
-    USING (
-        SELECT
-            provnum,
-            provname,
-            city,
-            state,
-            county_name,
-            county_fips,
-            cy_qtr,
-            workdate,
-            mdscensus,
-            hrs_rndon,
-            hrs_rndon_emp,
-            hrs_rndon_ctr,
-            hrs_rnadmin,
-            hrs_rnadmin_emp,
-            hrs_rnadmin_ctr,
-            hrs_rn,
-            hrs_rn_emp,
-            hrs_rn_ctr,
-            hrs_lpnadmin,
-            hrs_lpnadmin_emp,
-            hrs_lpnadmin_ctr,
-            hrs_lpn,
-            hrs_lpn_emp,
-            hrs_lpn_ctr,
-            hrs_cna,
-            hrs_cna_emp,
-            hrs_cna_ctr,
-            hrs_natrn,
-            hrs_natrn_emp,
-            hrs_natrn_ctr,
-            hrs_medaide,
-            hrs_medaide_emp,
-            hrs_medaide_ctr
-        FROM staging.pbj_daily_nurse_staffing_stg
-        WHERE provnum IS NOT NULL
-          AND workdate IS NOT NULL
-    ) AS src
+    USING tmp_pbj_merge_src AS src
     ON  silver.pbj_daily_nurse_staffing.provnum  = src.provnum
     AND silver.pbj_daily_nurse_staffing.workdate = src.workdate
 
-    -- Update only when incoming file is newer, or same-time but different content
-    WHEN MATCHED AND (
-        p_drive_modified_at > _drive_modified_at
-        OR (
-            p_drive_modified_at = _drive_modified_at
-            AND p_md5hash > _md5hash
-        )
-    ) THEN
+    WHEN MATCHED THEN
         UPDATE SET
             provname        = src.provname,
             city            = src.city,
@@ -141,6 +127,8 @@ BEGIN
             p_s3_key, p_drive_modified_at, p_md5hash, SYSDATE
         );
 
+    DROP TABLE tmp_pbj_merge_src;
+
 EXCEPTION WHEN OTHERS THEN
     IF SQLERRM ILIKE '%invalid%'
        OR SQLERRM ILIKE '%out of range%'
@@ -151,7 +139,9 @@ EXCEPTION WHEN OTHERS THEN
        OR SQLERRM ILIKE '%numeric%' THEN
         RAISE EXCEPTION 'DATA_ERROR | % | source: %', SQLERRM, p_s3_key;
     ELSE
-        RAISE;
+        -- Bare RAISE (re-raise as-is) needs NONATOMIC mode in Redshift;
+        -- this procedure runs atomic, so re-raise explicitly instead.
+        RAISE EXCEPTION '%', SQLERRM;
     END IF;
 END;
 $$;
