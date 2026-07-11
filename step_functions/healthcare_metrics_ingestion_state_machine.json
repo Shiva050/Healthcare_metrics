@@ -1,5 +1,5 @@
 {
-  "Comment": "PBJ Staffing ingestion: GDrive -> S3 (Bronze) -> Redshift Silver. SQL is bound via Parameters (not string-interpolated) to avoid injecting unsanitized S3 keys into generated SQL. Every terminal path (success or DLQ) writes merge_status back to the DynamoDB control table so a merge failure after the Lambda has already recorded the file's md5 doesn't get silently skipped on the next run. The merge retry is bounded to one extra attempt before falling through to the DLQ.",
+  "Comment": "Healthcare Metrics ingestion: GDrive -> S3 (Bronze) -> Redshift Silver, for both PBJ Daily Nurse Staffing and NH Provider Info monthly snapshots. Each Drive file is classified by filename (RouteByFileType) into its own copy/merge-or-load branch. SQL is bound via Parameters (not string-interpolated) to avoid injecting unsanitized S3 keys into generated SQL. A pre-check (CheckPbjDuplicates / CheckNhDuplicates) rejects any file with duplicate key rows straight to the DLQ before its merge/load proc is ever called. Every terminal path (success or DLQ) writes merge_status back to the DynamoDB control table so a failure after the Lambda has already recorded the file's md5 doesn't get silently skipped on the next run. The merge/load retry is bounded to one extra attempt before falling through to the DLQ.",
   "StartAt": "InvokeGDriveToS3Lambda",
   "States": {
 
