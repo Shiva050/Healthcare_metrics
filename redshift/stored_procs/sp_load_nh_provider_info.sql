@@ -65,18 +65,18 @@ AS $$
 BEGIN
 
     -- Guard against the source CSV itself containing more than one row for
-    -- the same provnum + snapshot_date_key (Redshift's MERGE would error out
-    -- on this if we were using MERGE; for DELETE+INSERT it would instead
-    -- silently duplicate rows in silver, which is just as bad).
-    -- p_snapshot_date_key is included in the PARTITION BY for consistency
-    -- with the (provnum, snapshot_date_key) key used everywhere else in this
-    -- proc (see the DELETE below) — it's a no-op today since staging only
-    -- ever holds one snapshot's rows per call, but keeps the partition
-    -- correct if that invariant ever changes. p_drive_modified_at and
-    -- p_md5hash are constant for every row in this call (one file per
-    -- call), so this can't prefer one duplicate over another on real
+    -- the same provnum (Redshift's MERGE would error out on this if we were
+    -- using MERGE; for DELETE+INSERT it would instead silently duplicate
+    -- rows in silver, which is just as bad).
+    -- PARTITION BY provnum alone, not provnum + snapshot_date_key: one file
+    -- = one snapshot per call, so provnum is the full within-file grain;
+    -- snapshot_date_key is constant here and lives in the DELETE/INSERT
+    -- keys below, not the partition — adding a constant to PARTITION BY
+    -- wouldn't change which rows group together, just add noise. Likewise
+    -- p_drive_modified_at and p_md5hash are constant for every row in this
+    -- call, so this can't prefer one duplicate over another on real
     -- lineage grounds — it just picks one deterministically so exactly one
-    -- row per (provnum, snapshot_date_key) reaches the DELETE/INSERT below.
+    -- row per provnum reaches the DELETE/INSERT below.
     CREATE TEMP TABLE IF NOT EXISTS tmp_nh_stg_dedup (LIKE staging.nh_provider_info_stg);
     DELETE FROM tmp_nh_stg_dedup;
 
@@ -122,7 +122,7 @@ BEGIN
     FROM (
         SELECT s.*,
                ROW_NUMBER() OVER (
-                   PARTITION BY provnum, p_snapshot_date_key
+                   PARTITION BY provnum
                    ORDER BY p_drive_modified_at DESC, p_md5hash DESC
                ) AS rn
         FROM staging.nh_provider_info_stg s
