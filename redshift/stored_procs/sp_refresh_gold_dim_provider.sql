@@ -111,6 +111,25 @@ BEGIN
         SYSDATE
     FROM tmp_dim_flagged;
 
+    -- Unknown member: a single sentinel row (provider_key = -1) so fact rows
+    -- whose provnum/month has no real dim_provider version still resolve to a
+    -- dimension member instead of a NULL key. gold.fact_daily_staffing_metrics
+    -- COALESCEs its looked-up provider_key to -1 to point missing providers
+    -- here. -1 is used deliberately (never produced by FNV_HASH for a real
+    -- key in practice); provnum 'UNKNOWN' / month_key 0 are sentinels, and the
+    -- descriptive attributes are 'Unknown'/NULL. is_current = TRUE so it isn't
+    -- filtered out by a "current only" predicate.
+    INSERT INTO gold.dim_provider (
+        provider_key, provnum, month_key, effective_from, effective_to, is_current,
+        provider_name, provider_address, city, state, zip_code,
+        county_name, ownership_type, provider_type, certified_beds, _refreshed_at
+    )
+    VALUES (
+        -1, 'UNKNOWN', 0, 0, NULL, TRUE,
+        'Unknown', NULL, NULL, NULL, NULL,
+        NULL, NULL, NULL, NULL, SYSDATE
+    );
+
     DROP TABLE tmp_dim_flagged;
 
 EXCEPTION WHEN OTHERS THEN

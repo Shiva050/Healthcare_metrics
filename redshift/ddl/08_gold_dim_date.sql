@@ -6,17 +6,19 @@
 --              not sourced from any ingested data), so its refresh is a
 --              generate-and-replace, not a reshape/rollup of anything.
 --
--- date_key   : INTEGER YYYYMMDD, day-grain natural key — same convention as
---              silver's workdate, for joining to daily-grain data if ever
---              needed (silver.pbj_daily_nurse_staffing.workdate, e.g.).
+-- date_key   : INTEGER YYYYMMDD, day-grain natural key — the FK target for
+--              gold.fact_daily_staffing_metrics.date_key (that fact is daily,
+--              so it joins here 1:1 on date_key), and the same convention as
+--              silver.pbj_daily_nurse_staffing.workdate.
 -- month_key  : INTEGER YYYYMM (6-digit, e.g. 202410) — same convention and
 --              column name as gold.dim_provider.month_key,
---              gold.fact_monthly_staffing_metrics.month_key, and
---              gold.fact_provider_quality_metrics.month_key, so this table
---              equi-joins to all three on (month_key) directly.
+--              gold.fact_daily_staffing_metrics.month_key, and
+--              gold.fact_provider_quality_metrics.month_key. NB: month_key
+--              repeats for every day of a month here (day grain), so a
+--              month-grain table must join on the first-of-month date_key,
+--              not on month_key, to avoid a ~30x fan-out.
 -- day_of_week: 0=Sunday..6=Saturday (Redshift EXTRACT(DOW ...) convention),
---              matching the same convention already used for the weekend
---              HPRD split in sp_refresh_gold_fact_monthly_staffing_metrics.
+--              the same day-of-week convention used across the pipeline.
 --
 -- Refresh : gold.sp_refresh_gold_dim_date(p_start_date, p_end_date), full
 --           TRUNCATE + INSERT — cheap even for a multi-decade range (a

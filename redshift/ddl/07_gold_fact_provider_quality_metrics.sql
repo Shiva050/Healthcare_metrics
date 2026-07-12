@@ -10,13 +10,17 @@
 -- month_key  : INTEGER YYYYMM (6-digit, e.g. 202410), derived by truncating
 --              silver's snapshot_date_key (YYYYMMDD, always first-of-month)
 --              to its year+month. Same convention and column name as
---              gold.dim_provider.month_key, gold.dim_date.month_key, and
---              gold.fact_monthly_staffing_metrics.month_key, so this table
---              joins to all three on a plain provnum/month_key equi-join —
---              e.g. gold.fact_monthly_staffing_metrics for combined
---              staffing-vs-quality analysis (does low HPRD correlate with
---              more deficiencies/penalties), or gold.dim_date for calendar
---              attributes.
+--              gold.dim_provider.month_key and
+--              gold.fact_daily_staffing_metrics.month_key, so this table
+--              joins to them on a plain provnum/month_key equi-join — e.g.
+--              rolling the daily staffing fact up to month and joining here
+--              for combined staffing-vs-quality analysis (does low HPRD
+--              correlate with more deficiencies/penalties). For calendar
+--              attributes from gold.dim_date (which is day-grain), join on a
+--              first-of-month date_key rather than month_key to avoid a ~30x
+--              fan-out — this monthly fact doesn't carry a date_key today, so
+--              add one (= snapshot_date_key, already first-of-month YYYYMMDD)
+--              if that join is needed.
 --
 -- Refresh    : full TRUNCATE + INSERT by
 --              gold.sp_refresh_gold_fact_provider_quality_metrics.

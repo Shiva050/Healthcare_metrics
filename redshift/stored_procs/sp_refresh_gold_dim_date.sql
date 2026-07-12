@@ -16,9 +16,8 @@
 -- needing to check feature availability first.
 --
 -- day_of_week uses Redshift's EXTRACT(DOW ...) convention (0=Sunday..
--- 6=Saturday) — matching the same convention already used for the weekend
--- HPRD split in sp_refresh_gold_fact_monthly_staffing_metrics, so "is
--- Sat/Sun" logic stays consistent across the gold layer.
+-- 6=Saturday), the same day-of-week convention used across the gold layer,
+-- so "is Sat/Sun" logic stays consistent.
 --
 -- TO_CHAR's 'Day'/'Month' format codes pad their output to a fixed width
 -- unless prefixed with 'FM' (fill mode) — using 'FMDay'/'FMMonth' here to

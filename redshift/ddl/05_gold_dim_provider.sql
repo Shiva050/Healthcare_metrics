@@ -42,6 +42,13 @@
 -- by comparing every month's attributes to the prior month's (LAG, per
 -- provnum) — no incremental "what changed since last run" state needed.
 --
+-- Unknown member: the refresh proc also seeds one sentinel row with
+-- provider_key = -1 (provnum 'UNKNOWN', month_key 0, attributes 'Unknown'/
+-- NULL). Fact tables COALESCE a missed provider_key lookup to -1 so orphaned
+-- providers (staffing reported for a month with no NH snapshot) roll into an
+-- explicit Unknown bucket instead of a NULL key. -1 is safe as a sentinel —
+-- real keys come from FNV_HASH and don't collide with it in practice.
+--
 -- Refresh : gold.sp_refresh_gold_dim_provider, full TRUNCATE + INSERT.
 -- DISTKEY : provnum (joins to both gold fact tables on this column)
 -- SORTKEY : provnum, month_key (per-provider time-series scans; matches the
