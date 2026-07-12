@@ -1,5 +1,5 @@
 {
-  "Comment": "Healthcare Metrics gold refresh: rebuilds gold.dim_provider, gold.fact_daily_staffing_metrics, and gold.fact_provider_quality_metrics from silver. Triggered by an EventBridge rule matching the 'SilverLoadSucceeded' event the ingestion state machine publishes on completion (see PublishSilverLoadSucceeded in healthcare_metrics_ingestion_state_machine.json) -- not a fixed schedule, so gold always refreshes because silver just changed, not on a timer that has to guess whether it did. All three refreshes run as independent Parallel branches (unlike ingestion's serialized per-file Map, these touch disjoint gold tables with no shared mutable state to race on) via full TRUNCATE + INSERT stored procs -- same delete-then-insert idempotency philosophy already used for silver.nh_provider_info, safe to rerun after any failure. Each branch classifies its own DATA_ERROR (bad data, no retry, straight to DLQ) vs. transient failures (one bounded retry) the same way the silver merge/load procs do, and routes failures to a gold-specific DLQ so a gold data error never mixes with file-ingestion failures. NOTE (temporary): the gold.fact_provider_quality_metrics refresh branch is currently removed from this Parallel state to test the staffing path in isolation -- re-add it (sp_refresh_gold_fact_provider_quality_metrics still exists) before treating the gold layer as complete.",
+  "Comment": "Healthcare Metrics gold refresh: rebuilds gold.dim_provider then gold.fact_daily_staffing_metrics from silver, plus (when re-enabled) gold.fact_provider_quality_metrics. Triggered by an EventBridge rule matching the 'SilverLoadSucceeded' event the ingestion state machine publishes on completion (see PublishSilverLoadSucceeded in healthcare_metrics_ingestion_state_machine.json) -- not a fixed schedule, so gold always refreshes because silver just changed, not on a timer that has to guess whether it did. Ordering: within the single Parallel branch below, dim_provider runs FIRST and fact_daily_staffing_metrics runs only after it succeeds -- the fact LEFT JOINs gold.dim_provider to resolve provider_key, so running them concurrently would let the fact read a not-yet-rebuilt (or empty, on first run) dim_provider and resolve every key to the -1 Unknown member. If dim_provider fails, its DLQ path ends the branch and the fact refresh is correctly skipped rather than run against a stale dimension. Each step is a full TRUNCATE + INSERT stored proc -- same delete-then-insert idempotency philosophy already used for silver.nh_provider_info, safe to rerun after any failure -- and classifies its own DATA_ERROR (bad data, no retry, straight to DLQ) vs. transient failures (one bounded retry), routing failures to a gold-specific DLQ so a gold data error never mixes with file-ingestion failures. NOTE (temporary): the gold.fact_provider_quality_metrics refresh is currently removed to test the staffing path in isolation. It reads silver.nh_provider_info directly and does NOT depend on dim_provider, so re-add it (sp_refresh_gold_fact_provider_quality_metrics still exists) as its own SECOND Parallel branch running concurrently with the dim->fact branch, not chained after the fact, before treating the gold layer as complete.",
   "StartAt": "RefreshGoldTables",
   "States": {
     "RefreshGoldTables": {
@@ -59,7 +59,7 @@
                 {
                   "Variable": "$.exec_status.Status",
                   "StringEquals": "FINISHED",
-                  "Next": "DimProviderRefreshSuccess"
+                  "Next": "ExecuteDailyStaffingRefresh"
                 },
                 {
                   "Variable": "$.exec_status.Status",
@@ -138,7 +138,7 @@
                 {
                   "Variable": "$.exec_status.Status",
                   "StringEquals": "FINISHED",
-                  "Next": "DimProviderRefreshSuccess"
+                  "Next": "ExecuteDailyStaffingRefresh"
                 },
                 {
                   "Variable": "$.exec_status.Status",
@@ -179,14 +179,6 @@
               ],
               "End": true
             },
-            "DimProviderRefreshSuccess": {
-              "Type": "Succeed"
-            }
-          }
-        },
-        {
-          "StartAt": "ExecuteDailyStaffingRefresh",
-          "States": {
             "ExecuteDailyStaffingRefresh": {
               "Type": "Task",
               "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
