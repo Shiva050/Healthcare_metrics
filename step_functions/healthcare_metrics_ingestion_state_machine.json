@@ -24,6 +24,43 @@
           "BackoffRate": 2
         }
       ],
+      "Next": "ReportLambdaErrorsToDLQ"
+    },
+
+    "ReportLambdaErrorsToDLQ": {
+      "Type": "Map",
+      "Comment": "Files that failed inside the Lambda itself (bad filename classification, Drive download failure, etc.) land in $.ingestion.errors, never $.ingestion.processed, so they'd otherwise never reach the Map below and would silently vanish with no DLQ trace. Runs over an empty array (the common case) as a zero-iteration no-op.",
+      "ItemsPath": "$.ingestion.errors",
+      "MaxConcurrency": 5,
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "INLINE" },
+        "StartAt": "SendLambdaErrorToDLQ",
+        "States": {
+          "SendLambdaErrorToDLQ": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::sqs:sendMessage",
+            "Parameters": {
+              "QueueUrl": "https://sqs.us-east-1.amazonaws.com/995679261492/health_care_metrics_silver_processing_DLQ",
+              "MessageAttributes": {
+                "error_type": { "DataType": "String", "StringValue": "LAMBDA_PROCESSING_FAILED" },
+                "file_name":  { "DataType": "String", "StringValue.$": "$.file" }
+              },
+              "MessageBody.$": "States.JsonToString($)"
+            },
+            "ResultPath": null,
+            "Retry": [
+              {
+                "ErrorEquals": ["States.TaskFailed"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.lambda_error_dlq_results",
       "Next": "HasFilesToProcess"
     },
 
@@ -1367,6 +1404,66 @@
         }
       },
       "ResultPath": "$.map_results",
+      "Next": "PublishSilverLoadSucceeded"
+    },
+
+    "PublishSilverLoadSucceeded": {
+      "Type": "Task",
+      "Comment": "Fires once per state-machine execution, after every file in this run has been processed (successfully or via its own DLQ route) -- not once per file. This is what triggers the gold refresh state machine: an EventBridge rule matches on source/detail-type below and starts that execution directly, so gold always runs because silver just finished, not on a timer guessing whether it did. Fires regardless of per-file outcomes inside the Map -- individual file failures are already handled there, and gold rebuilding from whatever silver currently has is correct either way.",
+      "Resource": "arn:aws:states:::events:putEvents",
+      "Parameters": {
+        "Entries": [
+          {
+            "Source": "healthcare.metrics.ingestion",
+            "DetailType": "SilverLoadSucceeded",
+            "EventBusName": "default",
+            "Detail": {
+              "execution_id.$": "$$.Execution.Id",
+              "finished_at.$": "$$.State.EnteredTime",
+              "map_results.$": "$.map_results"
+            }
+          }
+        ]
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.publish_error",
+          "Next": "SendGoldTriggerErrorToDLQ"
+        }
+      ],
+      "Next": "IngestionComplete"
+    },
+
+    "SendGoldTriggerErrorToDLQ": {
+      "Comment": "Silver already loaded successfully at this point -- a failed publish only means gold won't be triggered for this run, not that ingestion itself failed. Traced here (rather than silently continuing to IngestionComplete) so a missed gold trigger is visible instead of silently skipped; the next successful ingestion run's publish will trigger a gold refresh that rebuilds from everything currently in silver anyway, so this self-heals.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sqs:sendMessage",
+      "Parameters": {
+        "QueueUrl": "https://sqs.us-east-1.amazonaws.com/995679261492/health_care_metrics_silver_processing_DLQ",
+        "MessageAttributes": {
+          "error_type": { "DataType": "String", "StringValue": "GOLD_TRIGGER_PUBLISH_FAILED" }
+        },
+        "MessageBody.$": "States.JsonToString($)"
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
       "Next": "IngestionComplete"
     },
 
