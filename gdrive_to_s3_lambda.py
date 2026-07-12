@@ -92,8 +92,11 @@ FILE_TYPE_NH_PROVIDER_INFO = "NH_PROVIDER_INFO"
 _PBJ_STAFFING_RE = re.compile(r"^PBJ_Daily_Nurse_Staffing_.*\.csv$", re.IGNORECASE)
 
 # e.g. NH_ProviderInfo_Oct2024.csv — monthly snapshot, 3-letter month
-# abbreviation immediately followed by a 4-digit year.
-_NH_PROVIDER_INFO_RE = re.compile(r"^NH_ProviderInfo_([A-Za-z]{3})(\d{4})\.csv$", re.IGNORECASE)
+# abbreviation immediately followed by a 4-digit year. The optional
+# " (n)" suffix tolerates browser/OS duplicate-download naming (e.g.
+# "NH_ProviderInfo_Oct2024 (1).csv"), which is common on re-uploads and
+# repeated test runs and would otherwise fail classification outright.
+_NH_PROVIDER_INFO_RE = re.compile(r"^NH_ProviderInfo_([A-Za-z]{3})(\d{4})(?: \(\d+\))?\.csv$", re.IGNORECASE)
 
 _MONTH_ABBR = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,

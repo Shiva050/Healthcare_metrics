@@ -133,10 +133,14 @@ BEGIN
     -- Scoped delete: snapshot_date_key confines this to the current month,
     -- and the join to this file's provnums confines it to providers this
     -- file actually describes.
-    DELETE FROM silver.nh_provider_info t
+    -- Note: unlike standard Postgres, Redshift's DELETE does not allow an
+    -- alias on the target table (only on USING tables) — so the target is
+    -- referenced by its full schema.table name in the WHERE clause instead
+    -- of a "t" alias.
+    DELETE FROM silver.nh_provider_info
     USING tmp_nh_stg_dedup s
-    WHERE t.snapshot_date_key = p_snapshot_date_key
-      AND t.provnum = s.provnum;
+    WHERE silver.nh_provider_info.snapshot_date_key = p_snapshot_date_key
+      AND silver.nh_provider_info.provnum = s.provnum;
 
     INSERT INTO silver.nh_provider_info (
         provnum, provider_name, provider_address, city, state, zip_code,
