@@ -2,12 +2,14 @@
 --
 -- Grain      : provnum + month_key
 -- Source     : silver.pbj_daily_nurse_staffing, GROUP BY provnum and the
---              first-of-month of workdate.
--- month_key  : INTEGER YYYYMM01 (first-of-month), same convention as
---              silver.nh_provider_info.snapshot_date_key, so this table joins
---              cleanly to gold.fact_provider_quality_metrics on
---              (provnum, month_key = snapshot_date_key) for combined
---              staffing-vs-quality reporting.
+--              month of workdate.
+-- month_key  : INTEGER YYYYMM (6-digit, e.g. 202410), derived by truncating
+--              workdate (YYYYMMDD) to its year+month. Same convention as
+--              gold.dim_provider.month_key, gold.dim_date.month_key, and
+--              gold.fact_provider_quality_metrics.month_key, so this table
+--              joins cleanly to all three on a plain provnum/month_key
+--              equi-join for combined staffing-vs-quality-vs-calendar
+--              reporting — no date-range join, no format mismatch.
 --
 -- HPRD definitions (hours per resident day): direct-care hours only
 -- (hrs_rn/hrs_lpn/hrs_cna) divided by total resident days, deliberately
@@ -28,7 +30,7 @@
 CREATE TABLE IF NOT EXISTS gold.fact_monthly_staffing_metrics (
 
     provnum                     VARCHAR(20)     NOT NULL,
-    month_key                   INTEGER         NOT NULL,   -- YYYYMM01
+    month_key                   INTEGER         NOT NULL,   -- YYYYMM
 
     avg_daily_census            DECIMAL(7,2),
     total_resident_days         INTEGER,                    -- SUM(mdscensus); HPRD denominator

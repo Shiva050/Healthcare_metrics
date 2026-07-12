@@ -11,7 +11,9 @@
 -- re-guarding against something silver has already ruled out.
 --
 -- This is a reshape, not an aggregation — silver.nh_provider_info is already
--- at (provnum, snapshot_date_key) grain — aside from total_deficiencies_3yr,
+-- at (provnum, snapshot_date_key) grain — aside from month_key (silver's
+-- snapshot_date_key, YYYYMMDD, truncated to YYYYMM to match the gold
+-- layer's shared 6-digit month_key convention) and total_deficiencies_3yr,
 -- which sums the three health-survey cycles' total_health_deficiencies into
 -- one reporting-friendly figure.
 --
@@ -28,7 +30,7 @@ BEGIN
     TRUNCATE TABLE gold.fact_provider_quality_metrics;
 
     INSERT INTO gold.fact_provider_quality_metrics (
-        provnum, snapshot_date_key,
+        provnum, month_key,
         overall_rating, health_inspection_rating, qm_rating,
         longstay_qm_rating, shortstay_qm_rating, staffing_rating,
         total_nurse_turnover_pct, rn_turnover_pct, administrators_left_count,
@@ -39,7 +41,7 @@ BEGIN
         special_focus_status, abuse_icon, _refreshed_at
     )
     SELECT
-        provnum, snapshot_date_key,
+        provnum, snapshot_date_key / 100 AS month_key,
         overall_rating, health_inspection_rating, qm_rating,
         longstay_qm_rating, shortstay_qm_rating, staffing_rating,
         total_nurse_turnover_pct, rn_turnover_pct, administrators_left_count,

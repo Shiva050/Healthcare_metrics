@@ -6,9 +6,11 @@
 -- every run is simpler than tracking which months changed, and it's
 -- trivially idempotent.
 --
--- month_key : INTEGER YYYYMM01, derived from workdate (INTEGER YYYYMMDD) as
---             (workdate / 100) * 100 + 1 — integer division truncates the
---             day, so e.g. 20240615 -> 202406 -> 20240601.
+-- month_key : INTEGER YYYYMM (6-digit), derived from workdate (INTEGER
+--             YYYYMMDD) as workdate / 100 — integer division truncates the
+--             day, so e.g. 20240615 -> 202406. Same convention as
+--             gold.dim_provider.month_key, gold.dim_date.month_key, and
+--             gold.fact_provider_quality_metrics.month_key.
 --
 -- Two intermediate temp tables because the weekend HPRD figure needs a
 -- differently-filtered aggregation (Sat/Sun rows only) than every other
@@ -51,7 +53,7 @@ BEGIN
     INSERT INTO tmp_gold_monthly_agg
     SELECT
         provnum,
-        (workdate / 100) * 100 + 1                                   AS month_key,
+        workdate / 100                                   AS month_key,
         AVG(mdscensus)                                                AS avg_daily_census,
         SUM(mdscensus)                                                AS total_resident_days,
         COUNT(DISTINCT workdate)                                      AS days_reported,
@@ -62,7 +64,7 @@ BEGIN
         SUM(hrs_rn_ctr) + SUM(hrs_lpn_ctr) + SUM(hrs_cna_ctr)         AS contract_nurse_hours
     FROM silver.pbj_daily_nurse_staffing
     WHERE provnum IS NOT NULL AND workdate IS NOT NULL
-    GROUP BY provnum, (workdate / 100) * 100 + 1;
+    GROUP BY provnum, workdate / 100;
 
     CREATE TEMP TABLE IF NOT EXISTS tmp_gold_weekend_agg (
         provnum                VARCHAR(20),
@@ -75,14 +77,14 @@ BEGIN
     INSERT INTO tmp_gold_weekend_agg
     SELECT
         provnum,
-        (workdate / 100) * 100 + 1                                   AS month_key,
+        workdate / 100                                   AS month_key,
         SUM(hrs_rn) + SUM(hrs_lpn) + SUM(hrs_cna)                     AS weekend_nurse_hours,
         SUM(mdscensus)                                                AS weekend_resident_days
     FROM silver.pbj_daily_nurse_staffing
     WHERE provnum IS NOT NULL
       AND workdate IS NOT NULL
       AND DATE_PART(dow, TO_DATE(workdate::VARCHAR, 'YYYYMMDD')) IN (0, 6)  -- Sun=0, Sat=6
-    GROUP BY provnum, (workdate / 100) * 100 + 1;
+    GROUP BY provnum, workdate / 100;
 
     TRUNCATE TABLE gold.fact_monthly_staffing_metrics;
 

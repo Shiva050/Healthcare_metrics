@@ -1,26 +1,32 @@
 -- Gold fact: monthly quality/ratings KPIs per provider.
 --
--- Grain      : provnum + snapshot_date_key
+-- Grain      : provnum + month_key
 -- Source     : silver.nh_provider_info — already monthly-snapshot grain, so
 --              this is a business-curated reshape (ratings, turnover,
 --              deficiencies, penalties) rather than an aggregation. Column
 --              names are kept close to the silver source so this table reads
 --              as "the reporting-friendly subset of nh_provider_info", not a
 --              reinterpretation of it.
--- Join       : (provnum, snapshot_date_key) to
---              gold.fact_monthly_staffing_metrics (provnum, month_key) for
---              combined staffing-vs-quality analysis (e.g. does low HPRD
---              correlate with more deficiencies/penalties).
+-- month_key  : INTEGER YYYYMM (6-digit, e.g. 202410), derived by truncating
+--              silver's snapshot_date_key (YYYYMMDD, always first-of-month)
+--              to its year+month. Same convention and column name as
+--              gold.dim_provider.month_key, gold.dim_date.month_key, and
+--              gold.fact_monthly_staffing_metrics.month_key, so this table
+--              joins to all three on a plain provnum/month_key equi-join —
+--              e.g. gold.fact_monthly_staffing_metrics for combined
+--              staffing-vs-quality analysis (does low HPRD correlate with
+--              more deficiencies/penalties), or gold.dim_date for calendar
+--              attributes.
 --
 -- Refresh    : full TRUNCATE + INSERT by
 --              gold.sp_refresh_gold_fact_provider_quality_metrics.
 -- DISTKEY    : provnum
--- SORTKEY    : snapshot_date_key, provnum
+-- SORTKEY    : month_key, provnum
 
 CREATE TABLE IF NOT EXISTS gold.fact_provider_quality_metrics (
 
     provnum                             VARCHAR(20)     NOT NULL,
-    snapshot_date_key                   INTEGER         NOT NULL,   -- YYYYMM01
+    month_key                           INTEGER         NOT NULL,   -- YYYYMM
 
     -- ── Ratings ──────────────────────────────────────────────────────────────
     overall_rating                      SMALLINT,
@@ -58,4 +64,4 @@ CREATE TABLE IF NOT EXISTS gold.fact_provider_quality_metrics (
 )
 DISTSTYLE KEY
 DISTKEY (provnum)
-COMPOUND SORTKEY (snapshot_date_key, provnum);
+COMPOUND SORTKEY (month_key, provnum);
