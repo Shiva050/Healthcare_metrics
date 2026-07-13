@@ -1,0 +1,366 @@
+{
+  "Comment": "Healthcare Metrics gold refresh: rebuilds gold.dim_provider then gold.fact_daily_staffing_metrics from silver, plus (when re-enabled) gold.fact_provider_quality_metrics. Triggered by an EventBridge rule matching the 'SilverLoadSucceeded' event the ingestion state machine publishes on completion (see PublishSilverLoadSucceeded in healthcare_metrics_ingestion_state_machine.json) -- not a fixed schedule, so gold always refreshes because silver just changed, not on a timer that has to guess whether it did. Ordering: within the single Parallel branch below, dim_provider runs FIRST and fact_daily_staffing_metrics runs only after it succeeds -- the fact LEFT JOINs gold.dim_provider to resolve provider_key, so running them concurrently would let the fact read a not-yet-rebuilt (or empty, on first run) dim_provider and resolve every key to the -1 Unknown member. If dim_provider fails, its DLQ path ends the branch and the fact refresh is correctly skipped rather than run against a stale dimension. Each step is a full TRUNCATE + INSERT stored proc -- same delete-then-insert idempotency philosophy already used for silver.nh_provider_info, safe to rerun after any failure -- and classifies its own DATA_ERROR (bad data, no retry, straight to DLQ) vs. transient failures (one bounded retry), routing failures to a gold-specific DLQ so a gold data error never mixes with file-ingestion failures. NOTE (temporary): the gold.fact_provider_quality_metrics refresh is currently removed to test the staffing path in isolation. It reads silver.nh_provider_info directly and does NOT depend on dim_provider, so re-add it (sp_refresh_gold_fact_provider_quality_metrics still exists) as its own SECOND Parallel branch running concurrently with the dim->fact branch, not chained after the fact, before treating the gold layer as complete.",
+  "StartAt": "RefreshGoldTables",
+  "States": {
+    "RefreshGoldTables": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "ExecuteDimProviderRefresh",
+          "States": {
+            "ExecuteDimProviderRefresh": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+              "Parameters": {
+                "WorkgroupName": "default-workgroup",
+                "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
+                "Database": "healthcare_metrics",
+                "Sql": "CALL gold.sp_refresh_gold_dim_provider()"
+              },
+              "ResultPath": "$.exec_stmt",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.exec_error",
+                  "Next": "SendDimProviderErrorToDLQ"
+                }
+              ],
+              "Next": "WaitForDimProviderRefresh"
+            },
+            "WaitForDimProviderRefresh": {
+              "Type": "Wait",
+              "Seconds": 20,
+              "Next": "PollDimProviderRefreshStatus"
+            },
+            "PollDimProviderRefreshStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+              "Parameters": {
+                "Id.$": "$.exec_stmt.Id"
+              },
+              "ResultPath": "$.exec_status",
+              "Next": "IsDimProviderRefreshComplete"
+            },
+            "IsDimProviderRefreshComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.exec_status.Status",
+                  "StringEquals": "FINISHED",
+                  "Next": "ExecuteDailyStaffingRefresh"
+                },
+                {
+                  "Variable": "$.exec_status.Status",
+                  "StringEquals": "ABORTED",
+                  "Next": "SendDimProviderErrorToDLQ"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.exec_status.Status",
+                      "StringEquals": "FAILED"
+                    },
+                    {
+                      "Variable": "$.exec_status.Error",
+                      "StringMatches": "*DATA_ERROR*"
+                    }
+                  ],
+                  "Next": "SendDimProviderErrorToDLQ"
+                },
+                {
+                  "Variable": "$.exec_status.Status",
+                  "StringEquals": "FAILED",
+                  "Next": "RetryDimProviderRefresh"
+                }
+              ],
+              "Default": "WaitForDimProviderRefresh"
+            },
+            "RetryDimProviderRefresh": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+              "Parameters": {
+                "WorkgroupName": "default-workgroup",
+                "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
+                "Database": "healthcare_metrics",
+                "Sql": "CALL gold.sp_refresh_gold_dim_provider()"
+              },
+              "ResultPath": "$.exec_stmt",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.exec_error",
+                  "Next": "SendDimProviderErrorToDLQ"
+                }
+              ],
+              "Next": "WaitForDimProviderRefreshRetry"
+            },
+            "WaitForDimProviderRefreshRetry": {
+              "Type": "Wait",
+              "Seconds": 20,
+              "Next": "PollDimProviderRefreshRetryStatus"
+            },
+            "PollDimProviderRefreshRetryStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+              "Parameters": {
+                "Id.$": "$.exec_stmt.Id"
+              },
+              "ResultPath": "$.exec_status",
+              "Next": "IsDimProviderRefreshRetryComplete"
+            },
+            "IsDimProviderRefreshRetryComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.exec_status.Status",
+                  "StringEquals": "FINISHED",
+                  "Next": "ExecuteDailyStaffingRefresh"
+                },
+                {
+                  "Variable": "$.exec_status.Status",
+                  "StringEquals": "ABORTED",
+                  "Next": "SendDimProviderErrorToDLQ"
+                },
+                {
+                  "Variable": "$.exec_status.Status",
+                  "StringEquals": "FAILED",
+                  "Next": "SendDimProviderErrorToDLQ"
+                }
+              ],
+              "Default": "WaitForDimProviderRefreshRetry"
+            },
+            "SendDimProviderErrorToDLQ": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sqs:sendMessage",
+              "Parameters": {
+                "QueueUrl": "https://sqs.us-east-1.amazonaws.com/995679261492/health_care_metrics_gold_processing_DLQ",
+                "MessageAttributes": {
+                  "error_type": {
+                    "DataType": "String",
+                    "StringValue": "DIM_PROVIDER_REFRESH_FAILED"
+                  }
+                },
+                "MessageBody.$": "States.JsonToString($)"
+              },
+              "ResultPath": null,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "End": true
+            },
+            "ExecuteDailyStaffingRefresh": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+              "Parameters": {
+                "WorkgroupName": "default-workgroup",
+                "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
+                "Database": "healthcare_metrics",
+                "Sql": "CALL gold.sp_refresh_gold_fact_daily_staffing_metrics()"
+              },
+              "ResultPath": "$.exec_stmt",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.exec_error",
+                  "Next": "SendDailyStaffingErrorToDLQ"
+                }
+              ],
+              "Next": "WaitForDailyStaffingRefresh"
+            },
+            "WaitForDailyStaffingRefresh": {
+              "Type": "Wait",
+              "Seconds": 20,
+              "Next": "PollDailyStaffingRefreshStatus"
+            },
+            "PollDailyStaffingRefreshStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+              "Parameters": {
+                "Id.$": "$.exec_stmt.Id"
+              },
+              "ResultPath": "$.exec_status",
+              "Next": "IsDailyStaffingRefreshComplete"
+            },
+            "IsDailyStaffingRefreshComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.exec_status.Status",
+                  "StringEquals": "FINISHED",
+                  "Next": "DailyStaffingRefreshSuccess"
+                },
+                {
+                  "Variable": "$.exec_status.Status",
+                  "StringEquals": "ABORTED",
+                  "Next": "SendDailyStaffingErrorToDLQ"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.exec_status.Status",
+                      "StringEquals": "FAILED"
+                    },
+                    {
+                      "Variable": "$.exec_status.Error",
+                      "StringMatches": "*DATA_ERROR*"
+                    }
+                  ],
+                  "Next": "SendDailyStaffingErrorToDLQ"
+                },
+                {
+                  "Variable": "$.exec_status.Status",
+                  "StringEquals": "FAILED",
+                  "Next": "RetryDailyStaffingRefresh"
+                }
+              ],
+              "Default": "WaitForDailyStaffingRefresh"
+            },
+            "RetryDailyStaffingRefresh": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:redshiftdata:executeStatement",
+              "Parameters": {
+                "WorkgroupName": "default-workgroup",
+                "SecretArn": "arn:aws:secretsmanager:us-east-1:995679261492:secret:redshift!default-namespace-admin-gONVpo",
+                "Database": "healthcare_metrics",
+                "Sql": "CALL gold.sp_refresh_gold_fact_daily_staffing_metrics()"
+              },
+              "ResultPath": "$.exec_stmt",
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "ResultPath": "$.exec_error",
+                  "Next": "SendDailyStaffingErrorToDLQ"
+                }
+              ],
+              "Next": "WaitForDailyStaffingRefreshRetry"
+            },
+            "WaitForDailyStaffingRefreshRetry": {
+              "Type": "Wait",
+              "Seconds": 20,
+              "Next": "PollDailyStaffingRefreshRetryStatus"
+            },
+            "PollDailyStaffingRefreshRetryStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:redshiftdata:describeStatement",
+              "Parameters": {
+                "Id.$": "$.exec_stmt.Id"
+              },
+              "ResultPath": "$.exec_status",
+              "Next": "IsDailyStaffingRefreshRetryComplete"
+            },
+            "IsDailyStaffingRefreshRetryComplete": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.exec_status.Status",
+                  "StringEquals": "FINISHED",
+                  "Next": "DailyStaffingRefreshSuccess"
+                },
+                {
+                  "Variable": "$.exec_status.Status",
+                  "StringEquals": "ABORTED",
+                  "Next": "SendDailyStaffingErrorToDLQ"
+                },
+                {
+                  "Variable": "$.exec_status.Status",
+                  "StringEquals": "FAILED",
+                  "Next": "SendDailyStaffingErrorToDLQ"
+                }
+              ],
+              "Default": "WaitForDailyStaffingRefreshRetry"
+            },
+            "SendDailyStaffingErrorToDLQ": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sqs:sendMessage",
+              "Parameters": {
+                "QueueUrl": "https://sqs.us-east-1.amazonaws.com/995679261492/health_care_metrics_gold_processing_DLQ",
+                "MessageAttributes": {
+                  "error_type": {
+                    "DataType": "String",
+                    "StringValue": "DAILY_STAFFING_REFRESH_FAILED"
+                  }
+                },
+                "MessageBody.$": "States.JsonToString($)"
+              },
+              "ResultPath": null,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "End": true
+            },
+            "DailyStaffingRefreshSuccess": {
+              "Type": "Succeed"
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.gold_refresh_results",
+      "Next": "GoldRefreshComplete"
+    },
+    "GoldRefreshComplete": {
+      "Type": "Succeed"
+    }
+  }
+}

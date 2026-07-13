@@ -3,24 +3,32 @@ Lambda: Google Drive CSV  ->  S3 (with DynamoDB control table dedup)
 
 Flow per file found in the target Drive folder:
   1. List CSV files from Google Drive folder (including modifiedTime)
-  2. For each file, compute MD5 hash of its content
-  3. Look up the file_id in the DynamoDB control table
+  2. Classify each file by filename into a known file_type — PBJ_STAFFING or
+     NH_PROVIDER_INFO — and, for NH_PROVIDER_INFO, derive snapshot_date_key
+     from the filename (e.g. NH_ProviderInfo_Oct2024.csv -> "20241001").
+     Unrecognized filenames are rejected here (summary["errors"]) rather than
+     guessed at, since the Step Function branches per file_type and a
+     misclassified file would land in the wrong silver table.
+  3. For each file, compute MD5 hash of its content
+  4. Look up the file_id in the DynamoDB control table
      - Not found                        -> new file, download + upload to S3
      - Found, same md5, merge_status=SUCCESS -> already landed in Silver -> skip
      - Found, same md5, merge_status!=SUCCESS -> content unchanged but the
        last Redshift merge never completed (or we don't know that it did) ->
        re-offer it so the Step Function retries the merge
      - Found, different md5             -> content changed -> re-download + upload
-  4. Upload to S3 as  <original_name>_<YYYYMMDD_HHMMSS>.csv
+  5. Upload to S3 as  <original_name>_<YYYYMMDD_HHMMSS>.csv
      (timestamp derived from Drive modifiedTime, not processing time)
-  5. Upsert the control table with latest file_id, md5, drive_modified_at,
+  6. Upsert the control table with latest file_id, md5, drive_modified_at,
      s3_key, and merge_status=PENDING — the Step Function flips this to
      SUCCESS/FAILED once it knows whether the Redshift merge actually landed,
      so a merge failure after this Lambda has already run doesn't silently
      get skipped as "already processed" next time.
-  6. Return summary["processed"] entries include file_id, drive_modified_at,
-     and md5 for the downstream Step Function -> Redshift MERGE flow (it
-     needs file_id to update this same DynamoDB record's merge_status)
+  7. Return summary["processed"] entries include file_id, drive_modified_at,
+     md5, file_type, and snapshot_date_key (None for PBJ_STAFFING) for the
+     downstream Step Function, which needs file_type to route to the right
+     copy/load procs and file_id to update this same DynamoDB record's
+     merge_status.
 
 Placeholders (replace before deploy):
   DRIVE_FOLDER_ID   - Google Drive folder ID
@@ -33,6 +41,7 @@ import hashlib
 import io
 import json
 import logging
+import re
 from datetime import datetime
 
 import boto3
@@ -69,6 +78,58 @@ MERGE_STATUS_PENDING = "PENDING"
 MERGE_STATUS_SUCCESS = "SUCCESS"
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+# ---------------------------------------------------------------------------
+# File classification — same Drive folder holds multiple file types; the Step
+# Function needs to know which pipeline branch (copy/load procs) each file
+# belongs to.
+# ---------------------------------------------------------------------------
+FILE_TYPE_PBJ_STAFFING     = "PBJ_STAFFING"
+FILE_TYPE_NH_PROVIDER_INFO = "NH_PROVIDER_INFO"
+
+# e.g. PBJ_Daily_Nurse_Staffing_Q2_2024.csv — workdate is carried per row in
+# the file itself, so no filename-derived date key is needed for this type.
+_PBJ_STAFFING_RE = re.compile(r"^PBJ_Daily_Nurse_Staffing_.*\.csv$", re.IGNORECASE)
+
+# e.g. NH_ProviderInfo_Oct2024.csv — monthly snapshot, 3-letter month
+# abbreviation immediately followed by a 4-digit year. The optional
+# " (n)" suffix tolerates browser/OS duplicate-download naming (e.g.
+# "NH_ProviderInfo_Oct2024 (1).csv"), which is common on re-uploads and
+# repeated test runs and would otherwise fail classification outright.
+_NH_PROVIDER_INFO_RE = re.compile(r"^NH_ProviderInfo_([A-Za-z]{3})(\d{4})(?: \(\d+\))?\.csv$", re.IGNORECASE)
+
+_MONTH_ABBR = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _classify_file(file_name: str):
+    """Classify a source filename and, for monthly-snapshot types, derive
+    snapshot_date_key (INTEGER YYYYMMDD, first-of-month, as a string since
+    Redshift Data API parameters are always passed as text).
+
+    Returns (file_type, snapshot_date_key); snapshot_date_key is None for
+    file types that don't use one.
+
+    Raises ValueError for anything that doesn't match a known convention —
+    deliberately not guessed at: an unrecognized name surfaces as an error
+    (summary["errors"]) rather than risking a file landing in the wrong
+    silver table or under the wrong key.
+    """
+    m = _NH_PROVIDER_INFO_RE.match(file_name)
+    if m:
+        month_abbr, year = m.group(1).lower(), int(m.group(2))
+        month = _MONTH_ABBR.get(month_abbr)
+        if month is None:
+            raise ValueError(f"Unrecognized month abbreviation '{m.group(1)}' in filename: {file_name}")
+        snapshot_date_key = f"{year:04d}{month:02d}01"
+        return FILE_TYPE_NH_PROVIDER_INFO, snapshot_date_key
+
+    if _PBJ_STAFFING_RE.match(file_name):
+        return FILE_TYPE_PBJ_STAFFING, None
+
+    raise ValueError(f"Unrecognized file naming convention: {file_name}")
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +245,8 @@ def lambda_handler(event, context):
         drive_modified_at = f.get("modifiedTime", "")   # ISO-8601 e.g. "2024-06-15T10:30:00.000Z"
 
         try:
+            file_type, snapshot_date_key = _classify_file(file_name)
+
             record = _get_control_record(table, file_id)
 
             # --- Download to compute MD5 -----------------------------------
@@ -232,6 +295,8 @@ def lambda_handler(event, context):
                 "s3_key":            s3_key,
                 "drive_modified_at": drive_modified_at,
                 "md5":               current_md5,
+                "file_type":         file_type,
+                "snapshot_date_key": snapshot_date_key,
             })
 
         except Exception as exc:
