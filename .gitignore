@@ -8,6 +8,7 @@ __pycache__/
 
 # Secrets
 .env
+**/.streamlit/secrets.toml
 
 # Lambda packaging artifacts
 package/
