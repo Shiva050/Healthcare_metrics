@@ -51,23 +51,9 @@ schedules guessing whether upstream data is ready.**
 
 ## Architecture
 
-```mermaid
-flowchart TD
-    A["Google Drive folder<br/>(monthly CSVs)"] -->|Lambda: classify + MD5 dedup| B["S3 — Bronze<br/>health-care-metrics-prj-bronze"]
-    A -.->|control table| L[("DynamoDB<br/>drive ledger<br/>file_id · md5 · merge_status")]
+![Healthcare Metrics architecture](docs/health_caremetrics_architecture.drawio.png)
 
-    B --> SM1{{"Step Functions:<br/>Ingestion State Machine"}}
-    SM1 -->|COPY| STG["Redshift — staging<br/>(transient)"]
-    STG -->|dup pre-check → MERGE / DELETE+INSERT| SLV["Redshift — Silver<br/>pbj_daily_nurse_staffing<br/>nh_provider_info"]
-    SM1 -.->|per-file failure| DLQ1["SQS DLQ<br/>silver_processing_DLQ"]
-    SM1 -->|"putEvents: SilverLoadSucceeded"| EB(("EventBridge"))
-
-    EB -->|rule match| SM2{{"Step Functions:<br/>Gold Refresh State Machine"}}
-    SM2 -->|"TRUNCATE+INSERT (ordered)"| GLD["Redshift — Gold<br/>dim_provider · dim_date<br/>fact_daily_staffing_metrics"]
-    SM2 -.->|refresh failure| DLQ2["SQS DLQ<br/>gold_processing_DLQ"]
-
-    GLD -->|Redshift Data API| ST["Streamlit dashboard<br/>(cross-facility staffing)"]
-```
+> Editable source: [`docs/architecture.drawio`](docs/architecture.drawio) (open in [draw.io](https://app.diagrams.net)).
 
 The two state machines are decoupled by an **EventBridge event**: the ingestion
 machine publishes `SilverLoadSucceeded` when it finishes, and an EventBridge rule
